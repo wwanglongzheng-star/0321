@@ -1,0 +1,68 @@
+name: 打板策略回测
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: "回测开始日期（YYYY-MM-DD，留空用默认值）"
+        required: false
+        default: ""
+      end_date:
+        description: "回测结束日期（YYYY-MM-DD，留空用默认值）"
+        required: false
+        default: ""
+      max_stocks:
+        description: "最多回测股票数（留空=全量，建议先用200测试）"
+        required: false
+        default: "200"
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  backtest:
+    name: 打板策略回测
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 配置 Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: 安装依赖
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 运行回测
+        run: |
+          START="${{ github.event.inputs.start_date }}"
+          END="${{ github.event.inputs.end_date }}"
+          MAX="${{ github.event.inputs.max_stocks }}"
+
+          CMD="python daban_backtest.py --plot --factor-analysis --csv daban_trades.csv"
+          [ -n "$START" ] && CMD="$CMD --start $START"
+          [ -n "$END"   ] && CMD="$CMD --end $END"
+          [ -n "$MAX" ] && [ "$MAX" != "0" ] && CMD="$CMD --max-stocks $MAX"
+
+          echo "执行命令：$CMD"
+          eval $CMD
+
+      - name: 上传回测结果
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest-result-${{ github.run_number }}
+          path: |
+            daban_trades.csv
+            backtest_*.csv
+            backtest_*.png
+            *.log
+          if-no-files-found: warn
+          retention-days: 30
