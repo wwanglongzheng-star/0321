@@ -1,0 +1,1989 @@
+"""
+打板策略 · 历史回测框架（v4.0 全面优化版）
+================================================
+策略说明：
+  1. 首板策略  —— 当日出现首次涨停，次日竞价买入（假设涨停价附近成交）
+  2. 连板策略  —— 连续N日涨停，次日竞价买入（仅2~3连板，≥4连板次日折价）
+  3. 竞价打板  —— 集合竞价高开7%~9.9%，以昨日收盘*1.10尝试打板
+  4. 跌停反包  —— 昨日跌停，今日开盘反包做多
+
+v4.0 优化说明：
+  ★ 资金管理：改为固定仓位模拟（每笔固定10%仓位，最多同时持仓10只）
+               净值曲线基于实际资金变化，最大回撤计算更贴近实盘
+  ★ 并发持仓：同日信号多时，按量比+封板强度排序，只选最优N只入场
+  ★ 入场滑点：从0.2%提高到0.8%，更贴近实际竞价打板成本
+  ★ 首板出场：simulate_exit 起点修正（从i+2→i+1，避免漏掉入场当天价格变动）
+  ★ 趋势止损：MA5改为MA10，持仓≥5天才生效，减少早期噪音止损
+  ★ 止损优先级：理清ATR止损/时间止损优先级，同日触发取更优出场价
+  ★ 股票池扩大：改为中证1000+创业板指+科创50（移除大市值沪深300）
+  ★ 分析维度：增加按年度/月度统计、连续亏损分析、行业分布统计
+
+多因子过滤（来自公开研究数据）：
+  ★ 市值最优区间：10~100亿流通市值，胜率最高
+  ★ 量比最优区间：1.5~3.0（日线近似）
+  ★ 换手率最优区间：首板5%~15%；连板<15%
+  ★ 连板天数衰减：2连板胜率≈50%，≥4连板次日折价概率>60%
+  ★ 封板时间评分：越早封板胜率越高
+
+★ 假涨停过滤（回测验证有效性）：
+  - 炸板过滤：当日最高触及涨停，但收盘未涨停 → 不入场
+  - 次日缩量过滤：次日成交量 < 涨停日成交量×0.5 → 跳板风险高
+  - 量比异常：量比>5直接跳过（爆量出货特征）
+
+★ 股性识别过滤（回测验证有效性）：
+  - 一字板过滤：当日开盘即封板（开盘=最高=涨停价），实盘无法买入 → 不统计
+  - 日均成交额过滤：近20日日均成交额<3000万的流动性差股票 → 不统计
+  - 一字比例分析：历史涨停中一字板比例高的股票，实际胜率与理论差距大
+
+出场逻辑：
+  - ATR动态止损（T1前有效）
+  - 时间止损：持仓>2天未盈利，止损收紧至-3%
+  - T1止盈：+10% 触发跟踪止盈
+  - T2止盈：+20% 触发追踪止盈（不立即出场，让利润奔跑）
+  - MA10趋势止损：持仓≥5天生效
+  - 超时：持满 HOLD_DAYS 交易日
+
+运行方式：
+  python daban_backtest.py --codes 600519 000858 002594 300750 601318 000001
+  python daban_backtest.py --strategy 首板 连板
+  python daban_backtest.py --codes 600519 --plot
+  python daban_backtest.py --factor-analysis
+"""
+
+import pandas as pd
+import numpy as np
+import argparse
+import sys
+import os
+import csv
+import datetime
+import warnings
+import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from typing import Optional
+
+warnings.filterwarnings("ignore")
+
+# ★ Windows 控制台 UTF-8 修复（防止 emoji 打印崩溃）
+if sys.platform == "win32":
+    import io
+    if hasattr(sys.stdout, "buffer"):
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "buffer"):
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+
+try:
+    import baostock as bs
+    bs.login()
+    USE_BS = True
+except Exception:
+    USE_BS = False
+
+# ★ v3.4修复：baostock是单连接协议，多线程并发调用会导致数据交叉
+# 用线程锁保证对baostock的请求串行执行
+import threading
+_BS_LOCK = threading.Lock()
+
+try:
+    import akshare as ak
+    USE_AK = True
+except ImportError:
+    USE_AK = False
+
+USE_YF = False
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+    handlers=[logging.StreamHandler(stream=sys.stderr)],
+)
+log = logging.getLogger("daban_bt")
+
+# ================================================================
+# 回测参数
+# ================================================================
+STOP_LOSS    = -0.045  # 初始止损 -4.5%（后续被 ATR 动态止损替代）
+PROFIT_T1    = 0.10    # 第一止盈 +10%（打板策略利润空间大）
+PROFIT_T2    = 0.20    # 第二止盈 +20%（T2后不直接出，改启动更宽松跟踪止盈）
+HOLD_DAYS    = 7       # 最大持仓天数（动量效应最强区间）
+# ★ v4.0：滑点从 0.2% 提高到 0.8%，更贴近实际竞价打板成本
+SLIP         = 0.008   # 滑点（竞价打板实际溢价约0.5%~1%，取0.8%）
+COMMISSION   = 0.0003  # 万三手续费
+
+# ★ v4.0：资金管理参数
+POSITION_SIZE   = 0.10   # 每笔固定仓位比例（10%）
+MAX_POSITIONS   = 10     # 最大同时持仓数量
+INITIAL_CAPITAL = 1_000_000.0  # 初始资金（元）
+
+# 打板触发条件（用于历史数据模拟）
+ZT_THRESH      = 0.095   # 涨幅 ≥ 9.5% 视为涨停（含ST的5%涨停不计）
+DT_THRESH      = -0.095  # 跌幅 ≤ -9.5% 视为跌停
+# 竞价高开分三档（细分策略，每档独立统计）
+# 温和高开：+2%~+5%，情绪溢价低，空间大，量比要求高
+AUCTION_MILD_LOW   = 0.02   # 温和高开下限
+AUCTION_MILD_HIGH  = 0.05   # 温和高开上限
+# 强势高开：+5%~+7%，主流竞价打板区间，均衡空间与强度
+AUCTION_STRONG_LOW  = 0.05  # 强势高开下限
+AUCTION_STRONG_HIGH = 0.07  # 强势高开上限
+# 极限高开：+7%~+9.9%，接近涨停，空间极窄，仅做昨日涨停后
+AUCTION_LIMIT_LOW   = 0.07  # 极限高开下限
+AUCTION_LIMIT_HIGH  = 0.099 # 极限高开上限（<10%，未直接封板）
+MIN_ZT_DAYS    = 2       # 连板策略：最少连板天数（研究：2连板胜率最高）
+MAX_ZT_DAYS    = 3       # 连板策略：最多连板天数（≥4连板次日折价>60%，不追）
+
+STRATEGIES_ALL = ["首板", "竞价", "反包"]   # 回测结论：连板胜率仅21.8%(-2.28%)，已移除
+
+# ── 多因子过滤阈值（基于回测优化结论） ──────────────────────────────────
+# 市值区间（亿）：最优10~100亿，超出则折扣评分
+MKT_CAP_OPT_LOW  = 10    # 亿
+MKT_CAP_OPT_HIGH = 100   # 亿
+MKT_CAP_ABS_LOW  = 5     # 低于此直接过滤（ST/垃圾股）
+MKT_CAP_ABS_HIGH = 300   # 高于此直接过滤（大市值难封板）
+
+# 量比区间：回测门槛从3.0恢复至1.5以扩大样本量，因子分析中可观察各量比段差异
+# （若样本<500笔，门槛越高越难得到可信的分组统计）
+VOL_RATIO_LOW    = 1.5   # 回测用1.5（实盘selector.py仍用3.0），确保足够样本
+# ★ 优化②：量比上限从 8.0 降至 5.0（研究：量比呈倒U型，>5次日回调风险显著加大）
+VOL_RATIO_HIGH   = 5.0   # 上限从8.0降至5.0
+
+# 换手率：首板最优5%~15%，连板<15%
+TURNOVER_FIRST_LOW  = 5.0
+TURNOVER_FIRST_HIGH = 15.0
+TURNOVER_CONNECT    = 15.0  # 连板换手率上限
+
+# 是否启用多因子过滤（默认开启）
+ENABLE_FACTOR_FILTER = True
+
+# ── 假涨停过滤开关 ────────────────────────────────────────────────────────
+# 当日炸板检测：涨停日最高触及涨停价但收盘未达涨停 → 不入场
+FILTER_BOMB_DAY      = True   # 开启当日炸板过滤
+# 次日缩量检测：次日成交量 < 涨停日×FILTER_VOL_SHRINK → 跳板风险（软过滤，加扣分）
+FILTER_VOL_SHRINK    = 0.5    # 次日量能低于涨停日50%认为缩量
+# 量比异常爆量：>此值认为异常（出货拉停特征）
+# ★ 优化②：量比上限从 8.0 降至 5.0
+FILTER_VOL_RATIO_MAX = 5.0
+# 近N日内炸板次数超出上限 → 直接跳过
+FILTER_BOMB_HISTORY_DAYS  = 30
+FILTER_BOMB_HISTORY_MAX   = 2   # 恢复至2（原1太严，导致样本量不足）
+
+# ── 股性识别过滤开关 ──────────────────────────────────────────────────────
+# 一字板过滤：当日开盘即封板（无法买入），不统计为有效交易
+FILTER_YIZI_BOARD    = True   # 开启一字板过滤（强烈建议开启，一字板实盘根本打不进去）
+# 日均成交额下限（元）：低于此值流动性太差，排除
+FILTER_MIN_AVG_AMOUNT = 30_000_000   # 3000万
+# 一字比例阈值：近30日涨停中一字板超过此比例，认为该股买不进去
+FILTER_MAX_YIZI_RATIO = 0.70
+
+# ── 大盘环境过滤 ──────────────────────────────────────────────────────────
+# 利用个股自身MA判断市场环境（Colab无法拉指数，用持仓股均值替代）
+# 当大盘处于下行趋势时，打板胜率大幅下降，应暂停入场
+MARKET_FILTER_ENABLE = True   # 开启大盘环境过滤
+# 个股自身：收盘低于20日均线时，认为处于弱势，首板/连板不入场
+FILTER_STOCK_ABOVE_MA20 = True
+# 个股自身：近5日涨幅（动量）：5日内累计跌幅超过此值，说明大趋势向下，不追
+FILTER_MOMENTUM_5D    = -0.08   # 5日累跌>8% 不追板
+
+# ── 出场逻辑升级 ──────────────────────────────────────────────────────────
+# 跟踪止盈：达到T1后，止损线上移至成本价（保本止损），不再固定止损
+TRAIL_STOP_AFTER_T1  = True   # 触达T1后启动跟踪止盈
+# ★ 优化④：时间止损从3天→2天触发（研究：2天内未盈利亏损概率上升至65%）
+TIME_TIGHTEN_DAYS    = 2      # 持仓超过N天触发收紧（从3缩短至2天）
+TIME_TIGHTEN_LOSS    = -0.03  # 收紧后的止损线
+# 次日低开保护：入场次日低开超过此幅度，直接止损出场（避免追高后被砸）
+OPEN_GAP_ABORT       = -0.03  # 次日低开>3% 止损出场（仅入场第1天检查）
+
+# ★ 优化⑤：T2（+20%）后不直接出场，改为启动宽松追踪止盈，让利润奔跑
+# T2触发后，允许从T2高点最多回撤利润的30%才出场（而非立刻平仓）
+T2_TRAIL_ENABLE      = True   # 开启T2后追踪止盈
+T2_TRAIL_TOLERANCE   = 0.30   # T2后允许利润回撤比例（从最高点算）
+
+# ── 智能跟踪止盈（分档 + 强弱信号自适应）────────────────────────────────
+# 基础回撤容忍率：按盈利幅度分档，利润越多允许回撤比例越大
+# 格式：[(最低盈利阈值, 最高盈利阈值, 利润回撤容忍比例)]
+# 含义：当持仓盈利 X%，允许从最高盈利点回撤 Y% 的利润再出场
+TRAIL_PROFIT_TIERS = [
+    (0.00, 0.10, 1.00),   # 0~10%：全部保住，破盈亏平衡即出（保本）
+    (0.10, 0.20, 0.40),   # 10~20%：允许回撤利润的40%（赚10%可回落到+6%出）
+    (0.20, 0.30, 0.35),   # 20~30%：允许回撤利润的35%
+    (0.30, 9.99, 0.30),   # >30%：  允许回撤利润的30%（强趋势多持，但锁住70%利润）
+]
+# 强势信号（涨停/大阳线）：当日close_pos超过此值，回撤容忍度额外放宽
+TRAIL_STRONG_BONUS   =  0.05   # 强势当日回撤容忍 +5%（继续持有，让利润奔跑）
+TRAIL_STRONG_THRESH  =  0.90   # close_pos > 0.90 认为强势（收盘接近最高价）
+# 弱势信号：触发任一弱势信号，回撤容忍度收紧
+TRAIL_WEAK_PENALTY   = -0.10   # 弱势信号收紧 10%（靠近止盈线更容易触发）
+# 弱势信号1：缩量（当日成交量 < 5日均量×此比例）
+TRAIL_VOL_SHRINK_RATIO = 0.50
+# 弱势信号2：长上影（收盘位于日内区间下半部，即close_pos < 此值）
+TRAIL_UPPER_SHADOW_THRESH = 0.40
+
+# ── 入场保护 ──────────────────────────────────────────────────────────────
+# 次日低开过多不追：入场当天开盘相对昨收（涨停价）跌幅超此值，说明情绪转弱
+ENTRY_MAX_GAP_DOWN   = -0.03  # 次日低于涨停价3%以上不入场（情绪不延续）
+
+
+# ================================================================
+# 交易记录
+# ================================================================
+@dataclass
+class Trade:
+    code:         str
+    strategy:     str
+    entry_date:   str
+    entry_price:  float
+    exit_date:    str    = ""
+    exit_price:   float  = 0.0
+    exit_reason:  str    = ""  # stop_loss / target1 / target2 / timeout
+    pnl_pct:      float  = 0.0
+    holding_days: int    = 0
+    zt_days:      int    = 0   # 入场前连板天数（首板=1）
+    # 因子分析字段
+    circ_mkt_cap: float  = 0.0   # 流通市值（亿），0表示未知
+    vol_ratio:    float  = 0.0   # 量比（当日量/5日均量）
+    turnover:     float  = 0.0   # 换手率（%）
+    # 假涨停相关
+    is_bomb_day:  bool   = False  # 入场信号当日是否炸板（回测验证用）
+    bomb_30d:     int    = 0      # 入场前30日炸板次数
+    # 股性相关
+    is_yizi:      bool   = False  # 信号当日是否为一字板（开盘即封死，实盘买不进去）
+    avg_amplitude: float = 0.0   # 近20日日均振幅%（衡量弹性）
+    avg_amount_m:  float = 0.0   # 近20日日均成交额（百万元）
+
+
+# ================================================================
+# 数据获取
+# ================================================================
+def _code_to_yf(code: str) -> str:
+    c = code[:6]
+    return (c + ".SS") if c.startswith("6") else (c + ".SZ")
+
+
+def _fetch_history_bs(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
+    """baostock 拉取日线，支持海外IP。使用线程锁保证串行（baostock单连接协议）"""
+    with _BS_LOCK:
+        try:
+            num, mkt = code.split(".")
+            bs_code = ("sh." if mkt == "SH" else "sz.") + num
+            rs = bs.query_history_k_data_plus(
+                bs_code,
+                "date,open,high,low,close,volume,amount,turn",
+                start_date=start, end_date=end, frequency="d", adjustflag="2"
+            )
+            rows = []
+            while rs.error_code == "0" and rs.next():
+                rows.append(rs.get_row_data())
+            if not rows:
+                return None
+            df = pd.DataFrame(rows, columns=["date","开盘","最高","最低","收盘","成交量","成交额","换手率"])
+            for col in ["开盘","最高","最低","收盘","成交量","成交额","换手率"]:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+            df = df.dropna(subset=["收盘"])
+            return df
+        except Exception as e:
+            log.debug(f"{code} baostock失败: {e}")
+            return None
+
+
+def fetch_history(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
+    """拉取日线数据，统一列名：date / 开盘 / 最高 / 最低 / 收盘 / 成交量 / 成交额
+    优先 baostock（海外IP友好），失败则回退 akshare
+    """
+    try:
+        df = None
+        # ── 优先 baostock ─────────────────────────────────────────
+        if USE_BS:
+            df = _fetch_history_bs(code, start, end)
+
+        # ── 回退 akshare ──────────────────────────────────────────
+        if df is None and USE_AK:
+            df = ak.stock_zh_a_hist(
+                symbol=code[:6], period="daily",
+                start_date=start.replace("-", ""),
+                end_date=end.replace("-", ""),
+                adjust="qfq"
+            )
+            if df is not None:
+                df = df.rename(columns={
+                    "日期": "date", "开盘": "开盘", "最高": "最高", "最低": "最低",
+                    "收盘": "收盘", "成交量": "成交量", "成交额": "成交额"
+                })
+
+        if df is None or len(df) < 60:
+            return None
+
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.sort_values("date").reset_index(drop=True)
+
+        # ── 节后首日标记（国庆/春节/五一等假期后第一个交易日，高开低走风险极高）──
+        # 判断方法：相邻两个交易日间隔 > 3个自然日，则后一天视为节后首日
+        date_diff = df["date"].diff().dt.days
+        df["is_post_holiday"] = date_diff > 3
+
+        # 每日涨跌幅
+        df["prev_close"] = df["收盘"].shift(1)
+        df["chg_pct"]    = (df["收盘"] - df["prev_close"]) / df["prev_close"]
+
+        # 是否涨停 / 跌停
+        df["is_zt"] = df["chg_pct"] >= ZT_THRESH
+        df["is_dt"] = df["chg_pct"] <= DT_THRESH
+
+        # 量比：当日成交量 / 过去5日均量
+        # ★ v3.4修复：min_periods改为5，前5天不足时产生NaN，避免早期量比虚高误判
+        df["vol_ma5"]  = df["成交量"].rolling(5, min_periods=5).mean().shift(1)
+        df["vol_ratio"] = df["成交量"] / df["vol_ma5"].replace(0, np.nan)
+        df["vol_ratio"] = df["vol_ratio"].fillna(1.0)
+
+        # 换手率（日线只有成交量，没有流通股本，用量比代替）
+        df["turnover"] = df["vol_ratio"]  # placeholder，实盘用实际换手率
+
+        # ── 假涨停相关字段 ────────────────────────────────────────
+        # 当日是否炸板：最高触及涨停（≥+9.5%）但收盘未涨停（<+9.0%）
+        df["hi_chg"]   = (df["最高"] - df["prev_close"]) / df["prev_close"].replace(0, np.nan)
+        df["is_bomb"]  = (df["hi_chg"] >= ZT_THRESH) & (~df["is_zt"])
+        # 当日是否涨停后缩量次日（次日成交量 < 今日×FILTER_VOL_SHRINK）
+        df["vol_shrink_next"] = df["成交量"].shift(-1) < df["成交量"] * FILTER_VOL_SHRINK
+
+        # 近30日炸板次数（滚动窗口）
+        df["bomb_30d"] = df["is_bomb"].rolling(FILTER_BOMB_HISTORY_DAYS, min_periods=1).sum().shift(1).fillna(0)
+
+        # ── 股性识别字段 ──────────────────────────────────────────
+        # 一字板：当日涨停 且 开盘≈最高≈涨停价（开盘即封死，无法买入）
+        df["zt_price"] = df["prev_close"] * 1.10
+        df["is_yizi"]  = (df["is_zt"] &
+                          (np.abs(df["开盘"] - df["最高"]) < 0.02) &
+                          (np.abs(df["开盘"] - df["zt_price"]) < df["zt_price"] * 0.005))
+
+        # 日均振幅（近20日滚动，当日值）
+        amplitude = (df["最高"] - df["最低"]) / df["prev_close"].replace(0, np.nan) * 100
+        df["amplitude"]    = amplitude
+        df["avg_amp_20d"]  = amplitude.rolling(20, min_periods=5).mean()
+
+        # 日均成交额（近20日滚动，百万元）
+        if "成交额" in df.columns:
+            df["avg_amt_20d"] = df["成交额"].rolling(20, min_periods=5).mean() / 1e6
+        else:
+            df["avg_amt_20d"] = (df["成交量"] * (df["最高"] + df["最低"] + df["收盘"]) / 3 * 100).rolling(20, min_periods=5).mean() / 1e6
+
+        # 近30日一字板比例
+        df["yizi_ratio_30d"] = (df["is_yizi"].rolling(30, min_periods=5).sum() /
+                                df["is_zt"].rolling(30, min_periods=5).sum().replace(0, np.nan)).fillna(0.0)
+
+        # 连板天数
+        zt_streak = []
+        streak = 0
+        for v in df["is_zt"]:
+            if v:
+                streak += 1
+            else:
+                streak = 0
+            zt_streak.append(streak)
+        df["zt_streak"] = zt_streak
+
+        # ── 大盘环境 / 动量字段 ──────────────────────────────────
+        # MA20：股价是否处于20日均线之上（上升趋势）
+        df["ma20"] = df["收盘"].rolling(20, min_periods=10).mean()
+        df["above_ma20"] = df["收盘"] > df["ma20"]
+
+        # 近5日动量：当日收盘相对5日前收盘的涨跌幅（用shift(5)做前值）
+        df["mom_5d"] = (df["收盘"] - df["收盘"].shift(5)) / df["收盘"].shift(5).replace(0, np.nan)
+
+        # 涨停强度：收盘价在当日振幅区间中的位置（0=收在最低，1=收在最高）
+        # 用于衡量封板质量：接近1说明尾盘未出货，封板坚实
+        price_range = (df["最高"] - df["最低"]).replace(0, np.nan)
+        df["close_pos"] = (df["收盘"] - df["最低"]) / price_range  # 0~1
+
+        # ── ★ 优化⑧：ATR 动态止损字段 ────────────────────────────
+        # True Range = max(高-低, |高-前收|, |低-前收|)
+        df["tr1"] = df["最高"] - df["最低"]
+        df["tr2"] = (df["最高"] - df["prev_close"]).abs()
+        df["tr3"] = (df["最低"] - df["prev_close"]).abs()
+        df["true_range"] = df[["tr1","tr2","tr3"]].max(axis=1)
+        # ATR(14)：14日真实波幅均值
+        df["atr14"] = df["true_range"].rolling(14, min_periods=5).mean()
+        # ATR止损距离：以ATR倍数（默认1.5x）设定动态止损幅度
+        # atr_stop_pct：相对于入场价的止损百分比（负数）
+        df["atr_stop_pct"] = -(df["atr14"] / df["收盘"].replace(0, np.nan)) * 1.5
+        df["atr_stop_pct"] = df["atr_stop_pct"].clip(lower=-0.08, upper=-0.02)  # 限制在-2%~-8%
+
+        return df
+    except Exception as e:
+        log.debug(f"{code} 数据失败: {e}")
+        return None
+
+
+def fetch_pool_codes() -> list:
+    """
+    ★ v4.0：股票池改为中证1000 + 创业板指 + 科创50
+    移除沪深300（大市值难封板，打板机会极少，会稀释样本）
+    中证1000+创业板中小市值股才是打板主战场
+    """
+    # 优先 baostock：海外IP友好
+    if USE_BS:
+        try:
+            codes_bs = []
+            # 中证1000（小市值成长股，打板主力军）
+            rs = bs.query_zz500_stocks()  # baostock暂无中证1000接口，用中证500代替
+            while rs.error_code == "0" and rs.next():
+                codes_bs.append(rs.get_row_data()[1])
+            log.info(f"baostock中证500：{len(codes_bs)}只（作为中小市值代替）")
+
+            seen = set()
+            codes = []
+            for c in codes_bs:
+                if c in seen:
+                    continue
+                seen.add(c)
+                mkt, num = c.split(".")
+                codes.append(num + ".SH" if mkt == "sh" else num + ".SZ")
+            log.info(f"股票池（baostock）：{len(codes)} 只（中证500，打板主战场）")
+            return codes
+        except Exception as e:
+            log.warning(f"baostock 获取股票池失败: {e}，尝试 akshare")
+
+    # 备用 akshare：国内IP可用，拉中证1000+创业板指+科创50
+    if USE_AK:
+        try:
+            all_codes = []
+            # 中证1000（小市值成长股）
+            try:
+                df1 = ak.index_stock_cons("000852")
+                all_codes += df1["品种代码"].tolist()
+                log.info(f"中证1000：{len(df1)}只")
+            except Exception as e:
+                log.warning(f"中证1000拉取失败: {e}")
+
+            # 创业板指（创业板龙头，高弹性）
+            try:
+                df2 = ak.index_stock_cons("399006")
+                all_codes += df2["品种代码"].tolist()
+                log.info(f"创业板指：{len(df2)}只")
+            except Exception as e:
+                log.warning(f"创业板指拉取失败: {e}")
+
+            # 科创50（科创板，高科技高弹性）
+            try:
+                df3 = ak.index_stock_cons("000688")
+                all_codes += df3["品种代码"].tolist()
+                log.info(f"科创50：{len(df3)}只")
+            except Exception as e:
+                log.warning(f"科创50拉取失败: {e}")
+
+            # 去重并格式化
+            seen = set()
+            codes = []
+            for c in all_codes:
+                if c in seen:
+                    continue
+                seen.add(c)
+                codes.append(c + ".SH" if c.startswith("6") else c + ".SZ")
+
+            log.info(f"股票池（akshare）合计：{len(codes)} 只（中证1000+创业板指+科创50）")
+            return codes
+        except Exception as e:
+            log.error(f"akshare 获取股票池失败: {e}")
+
+    log.error("无法获取股票池，请用 --codes 指定")
+    return []
+
+
+# ================================================================
+# 出场逻辑（升级版）
+# ================================================================
+def _trail_stop_price(entry_price: float, peak_price: float,
+                      row: pd.Series, vol_ma5: float) -> float:
+    """
+    计算智能跟踪止盈的止损价格。
+    逻辑：
+      1. 按当前最高浮盈幅度确定基础回撤容忍比例（分4档）
+      2. 检测强势/弱势盘中信号，动态调整容忍度
+         - 强势（close_pos高）：放宽容忍，让利润继续奔跑
+         - 弱势（缩量/长上影）：收紧容忍，及时锁利
+      3. 止损价 = peak_price - (peak_price - entry_price) × 容忍比例
+    """
+    if peak_price <= entry_price:
+        return entry_price  # 保本线
+
+    cur_profit = (peak_price - entry_price) / entry_price  # 最高浮盈幅度
+
+    # ── 1. 基础回撤容忍比例（按盈利分档）──────────────────────
+    base_tolerance = 1.0  # 默认全部保住
+    for lo_t, hi_t, tol in TRAIL_PROFIT_TIERS:
+        if lo_t <= cur_profit < hi_t:
+            base_tolerance = tol
+            break
+
+    # ── 2. 强弱信号动态调整 ────────────────────────────────────
+    adjustment = 0.0
+    close_pos = float(row.get("close_pos", 0.5) or 0.5)
+    cur_vol   = float(row.get("成交量", 0) or 0)
+
+    # 强势信号：收盘接近最高价（大阳线/涨停），放宽容忍
+    if close_pos >= TRAIL_STRONG_THRESH:
+        adjustment += TRAIL_STRONG_BONUS
+
+    # 弱势信号1：缩量（量能萎缩，趋势衰竭），收紧容忍
+    if vol_ma5 > 0 and cur_vol < vol_ma5 * TRAIL_VOL_SHRINK_RATIO:
+        adjustment += TRAIL_WEAK_PENALTY
+
+    # 弱势信号2：长上影（开高走低，尾盘出货），收紧容忍
+    if close_pos < TRAIL_UPPER_SHADOW_THRESH:
+        adjustment += TRAIL_WEAK_PENALTY
+
+    # 最终容忍比例限制在 [0.0, 1.0]
+    tolerance = max(0.0, min(1.0, base_tolerance + adjustment))
+
+    # ── 3. 计算止损价：从历史最高点回落"利润×容忍比例" ────────
+    profit_amt   = peak_price - entry_price
+    max_pullback = profit_amt * tolerance
+    stop_p       = peak_price - max_pullback
+    return max(stop_p, entry_price)  # 至少保本
+
+
+def simulate_exit(df: pd.DataFrame, entry_idx: int, entry_price: float,
+                  atr_stop_pct: Optional[float] = None) -> tuple:
+    """
+    出场逻辑（v4.0 修复版，含智能跟踪止盈 + ATR动态止损 + T2后追踪止盈）：
+      1. 入场第1天低开保护：开盘低开>3% 直接止损
+      2. ★ v4.0 止损优先级修复：
+           同日 ATR止损 和 时间止损 同时触发时，取更优（亏损更小）的出场价
+           ATR动态止损（T1前有效）：止损 = 入场价 × (1 + atr_stop_pct)
+           时间止损（持仓>2天未盈利）：收紧至-3%
+      3. ★ v4.0 趋势止损改为MA10，持仓≥5天生效（减少早期噪音止损）
+      4. ★ 优化⑤ T2后追踪止盈：
+           触达 +20% 后不立即出场，改为跟踪最高点×(1-T2_TRAIL_TOLERANCE)
+      5. 智能跟踪止盈（T1+10%后启动）
+      6. 超时平仓（HOLD_DAYS=7天）
+    """
+    # ★ ATR动态止损（若有ATR数据则用，否则回退固定止损）
+    if atr_stop_pct is not None and atr_stop_pct < 0:
+        dynamic_stop_pct = atr_stop_pct   # 已限制在 -2%~-8%
+    else:
+        dynamic_stop_pct = STOP_LOSS      # 回退至固定止损 -4.5%
+
+    stop_price = entry_price * (1 + dynamic_stop_pct)   # 动态初始止损
+    t1_price   = entry_price * (1 + PROFIT_T1)   # +10%
+    t2_price   = entry_price * (1 + PROFIT_T2)   # +20%
+    n          = len(df)
+    t1_hit     = False         # 是否已触达T1（跟踪止盈激活标志）
+    t2_hit     = False         # 是否已触达T2（追踪止盈激活标志）
+    peak_price = entry_price   # 持仓期间历史最高价（跟踪止盈基准）
+
+    for j in range(entry_idx, min(entry_idx + HOLD_DAYS, n)):
+        row   = df.iloc[j]
+        hi    = float(row["最高"])
+        lo    = float(row["最低"])
+        cls   = float(row["收盘"])
+        op    = float(row["开盘"])
+        date  = str(row["date"])[:10]
+        days  = j - entry_idx + 1
+
+        # 更新持仓期间历史最高价（用最高价作为峰值基准）
+        peak_price = max(peak_price, hi)
+
+        # 计算5日均量（缩量判断用）
+        vol_ma5 = float(df["成交量"].iloc[max(0, j - 4):j].mean()) if j > 0 else 0.0
+
+        # ── 1. 入场第1天低开保护 ──────────────────────────────────
+        if days == 1 and OPEN_GAP_ABORT < 0:
+            if op < entry_price * (1 + OPEN_GAP_ABORT):
+                exit_p = round(op * (1 - SLIP - COMMISSION), 4)
+                return date, exit_p, "gap_abort", days
+
+        # ── 2. ★ v4.0 止损优先级修复：同日触发时取更优出场价 ──────
+        if not t1_hit:
+            # 时间止损收紧价
+            tighten_stop = entry_price * (1 + TIME_TIGHTEN_LOSS) if days > TIME_TIGHTEN_DAYS else None
+            # 当前有效止损价（取时间止损和ATR止损中更高（更宽松）的那个）
+            effective_stop = stop_price
+            if tighten_stop is not None:
+                effective_stop = max(stop_price, tighten_stop)
+                stop_price = effective_stop  # 止损线只能向上移
+
+            if lo <= effective_stop:
+                # 同日触发：出场价取 min(止损价, 开盘价)，不能超过开盘价成交
+                exit_p = min(effective_stop, op)
+                exit_p = round(exit_p * (1 - SLIP - COMMISSION), 4)
+                # 出场原因：时间止损和ATR止损都可能触发，按哪个价更高（亏更少）决定标签
+                if tighten_stop is not None and effective_stop >= tighten_stop:
+                    reason_label = "time_stop"
+                else:
+                    reason_label = "stop_loss"
+                return date, exit_p, reason_label, days
+
+        # ── 3. ★ 优化⑤：T2后追踪止盈（不立即出，让利润奔跑）─────
+        if T2_TRAIL_ENABLE:
+            if not t2_hit and hi >= t2_price:
+                t2_hit = True   # 触达T2，激活追踪止盈，不立刻出场
+                t1_hit = True   # 同时激活T1跟踪
+            if t2_hit:
+                # 从最高点回撤超过 T2_TRAIL_TOLERANCE 比例的已实现利润则出
+                profit_from_entry = peak_price - entry_price
+                t2_trail_stop = peak_price - profit_from_entry * T2_TRAIL_TOLERANCE
+                if cls <= t2_trail_stop:
+                    exit_p = round(cls * (1 - SLIP - COMMISSION), 4)
+                    return date, exit_p, "t2_trail", days
+        else:
+            # 兼容关闭开关时的原始逻辑
+            if hi >= t2_price:
+                exit_p = round(t2_price * (1 - SLIP - COMMISSION), 4)
+                return date, exit_p, "target2", days
+
+        # ── 4. T1后启动智能跟踪止盈 ──────────────────────────────
+        if not t1_hit and hi >= t1_price:
+            t1_hit = True  # 激活跟踪止盈，不立刻出场，继续等更高利润
+
+        if t1_hit and not t2_hit:   # T2追踪止盈优先，T1跟踪作为补充
+            trail_p = _trail_stop_price(entry_price, peak_price, row, vol_ma5)
+            # 收盘跌至跟踪止盈线下方则出场（用收盘价避免盘中噪音）
+            if cls <= trail_p:
+                exit_p = round(cls * (1 - SLIP - COMMISSION), 4)
+                return date, exit_p, "trail_stop", days
+
+        # ── 5. ★ v4.0 趋势止损：改为MA10，持仓≥5天生效 ───────────
+        # MA10 比 MA5 更稳定，持仓5天才生效避免早期噪音触发
+        if days >= 5:
+            ma10_close = df["收盘"].iloc[max(0, j - 9):j + 1].mean()
+            if cls < ma10_close * 0.99:
+                exit_p = round(cls * (1 - SLIP - COMMISSION), 4)
+                return date, exit_p, "ma10_stop", days
+
+        # ── 6. 超时平仓 ───────────────────────────────────────────
+        if days >= HOLD_DAYS:
+            exit_p = round(cls * (1 - SLIP - COMMISSION), 4)
+            return date, exit_p, "timeout", days
+
+    # 数据不足，用最后一天收盘平仓
+    last = df.iloc[min(entry_idx + HOLD_DAYS - 1, n - 1)]
+    return str(last["date"])[:10], round(float(last["收盘"]) * (1 - SLIP - COMMISSION), 4), "timeout", HOLD_DAYS
+
+
+# ================================================================
+# 策略1：首板
+# ================================================================
+def backtest_first_board(code: str, df: pd.DataFrame) -> list:
+    """
+    信号：当日 zt_streak == 1（首次涨停，昨日未涨停）
+    升级过滤：
+      ★ 大盘/趋势：股价须在MA20之上（上升通道），近5日动量不能过差
+      ★ 入场保护：次日开盘若低于涨停价×(1-ENTRY_MAX_GAP_DOWN)，说明情绪不延续，不追
+      ★ 封板强度：收盘位置(close_pos)<0.85 说明尾盘有出货，弱封不入场
+      ★ 量比：1.0~8.0
+      ★ 假涨停/股性过滤（同前）
+      ★ 振幅：>1.5%（迟钝股不做）
+    """
+    trades = []
+    n = len(df)
+
+    for i in range(1, n - 1):
+        row = df.iloc[i]
+
+        # 节后首日（国庆/春节/五一等长假后第一天）不入场，高开低走风险极高
+        if bool(row.get("is_post_holiday", False)):
+            continue
+
+        if not row["is_zt"]:
+            continue
+        if df.iloc[i - 1]["is_zt"]:
+            continue  # 昨日也涨停，不是首板
+
+        vol_ratio   = float(row.get("vol_ratio", 1.0))
+        is_bomb     = bool(row.get("is_bomb", False))
+        bomb_30d    = int(row.get("bomb_30d", 0))
+        is_yizi     = bool(row.get("is_yizi", False))
+        avg_amp     = float(row.get("avg_amp_20d", 0.0) or 0.0)
+        avg_amt_m   = float(row.get("avg_amt_20d", 0.0) or 0.0)
+        yizi_ratio  = float(row.get("yizi_ratio_30d", 0.0) or 0.0)
+        above_ma20  = bool(row.get("above_ma20", True))
+        mom_5d      = float(row.get("mom_5d", 0.0) or 0.0)
+        close_pos   = float(row.get("close_pos", 1.0) or 1.0)
+
+        if not ENABLE_FACTOR_FILTER:
+            pass
+        else:
+            # ── 大盘/趋势过滤 ──────────────────────────────────────
+            if FILTER_STOCK_ABOVE_MA20 and not above_ma20:
+                continue  # 股价在MA20之下，弱势不做首板
+            if mom_5d < FILTER_MOMENTUM_5D:
+                continue  # 近5日跌幅过大，趋势向下不追
+
+            # ── 假涨停硬过滤 ───────────────────────────────────────
+            if FILTER_BOMB_DAY and is_bomb:
+                continue
+            if bomb_30d > FILTER_BOMB_HISTORY_MAX:
+                continue
+            if vol_ratio > FILTER_VOL_RATIO_MAX:
+                continue
+            if vol_ratio < VOL_RATIO_LOW:
+                continue
+
+            # ★ 回测发现：首板高量比(>2.5)胜率反而更低（出货拉停特征）
+            # 量比1.5~2.5段是首板最优区间，>2.5的首板筛掉
+            if vol_ratio > 2.5:
+                continue  # 首板量比上限2.5（高量比首板多为出货，非加速）
+
+            # ── 封板强度过滤：回测数据上调至0.95（弱封极少成功）──
+            if close_pos < 0.95:
+                continue  # 尾盘出货明显，跳过（从0.92上调至0.95）
+
+            # ── 炸板历史过滤：首板零容忍（回测：炸板1次胜率降20%+）──
+            if bomb_30d > 0:
+                continue
+
+            # ── 股性过滤（振幅1.5%~6%，超活跃>5%段回测表现最优）──
+            if FILTER_YIZI_BOARD and is_yizi:
+                continue
+            if avg_amt_m > 0 and avg_amt_m * 1e6 < FILTER_MIN_AVG_AMOUNT:
+                continue
+            if yizi_ratio >= FILTER_MAX_YIZI_RATIO:
+                continue
+            if avg_amp > 0 and (avg_amp < 1.5 or avg_amp > 6.0):
+                continue  # 振幅上限从4%放开至6%（超活跃段胜率66.7%/+11.7%）
+
+        if i + 1 >= n:
+            break
+        nxt = df.iloc[i + 1]
+        nxt_open    = float(nxt["开盘"])
+        zt_price    = float(row["prev_close"] or 0) * 1.10  # 涨停价
+        if nxt_open <= 0:
+            continue
+
+        # ── 入场保护：次日低开过多不追 ────────────────────────────
+        if zt_price > 0:
+            gap = (nxt_open - zt_price) / zt_price
+            if gap < ENTRY_MAX_GAP_DOWN:
+                continue  # 次日相对涨停价低开过多，情绪不延续
+
+        entry_p    = nxt_open * (1 + SLIP + COMMISSION)
+        entry_date = str(nxt["date"])[:10]
+        # ★ 优化⑧：传入 ATR 动态止损幅度（当日的 atr_stop_pct）
+        # ★ v4.0修复：simulate_exit 起点从 i+2 修正为 i+1（入场次日=i+1的后一天）
+        # 入场日是 i+1，次日开始持仓检查从 i+1 当天开始（检查低开保护）
+        atr_stop = float(row.get("atr_stop_pct", STOP_LOSS) or STOP_LOSS)
+        exit_date, exit_p, reason, hdays = simulate_exit(df, i + 1, entry_p, atr_stop)
+        pnl = (exit_p - entry_p) / entry_p
+
+        trades.append(Trade(
+            code=code, strategy="首板",
+            entry_date=entry_date, entry_price=round(entry_p, 4),
+            exit_date=exit_date, exit_price=exit_p,
+            exit_reason=reason, pnl_pct=round(pnl, 4),
+            holding_days=hdays, zt_days=1,
+            vol_ratio=round(vol_ratio, 2),
+            is_bomb_day=is_bomb,
+            bomb_30d=int(bomb_30d),
+            is_yizi=is_yizi,
+            avg_amplitude=round(avg_amp, 2),
+            avg_amount_m=round(avg_amt_m, 1),
+        ))
+
+    return trades
+
+
+# ================================================================
+# 策略2：连板（买次日竞价）
+# ================================================================
+def backtest_connect_board(code: str, df: pd.DataFrame,
+                           min_days: int = MIN_ZT_DAYS,
+                           max_days: int = MAX_ZT_DAYS) -> list:
+    """
+    信号：zt_streak 在 [min_days, max_days] 范围内
+    升级过滤：
+      ★ 大盘/趋势：股价须在MA20之上，近5日动量不能过差
+      ★ 封板强度：close_pos < 0.90（连板要求更严）
+      ★ 入场保护：次日开盘相对昨日涨停价低开超阈值，不追
+      ★ 连板量比：<4.0（分歧过大不追）
+      ★ 假涨停/股性过滤（同前）
+    """
+    trades = []
+    n = len(df)
+
+    for i in range(1, n - 1):
+        # 节后首日不入场
+        if bool(df.iloc[i].get("is_post_holiday", False)):
+            continue
+        streak     = int(df.iloc[i]["zt_streak"])
+        vol_ratio  = float(df.iloc[i].get("vol_ratio", 1.0))
+        is_bomb    = bool(df.iloc[i].get("is_bomb", False))
+        bomb_30d   = int(df.iloc[i].get("bomb_30d", 0))
+        is_yizi    = bool(df.iloc[i].get("is_yizi", False))
+        avg_amp    = float(df.iloc[i].get("avg_amp_20d", 0.0) or 0.0)
+        avg_amt_m  = float(df.iloc[i].get("avg_amt_20d", 0.0) or 0.0)
+        yizi_ratio = float(df.iloc[i].get("yizi_ratio_30d", 0.0) or 0.0)
+        above_ma20 = bool(df.iloc[i].get("above_ma20", True))
+        mom_5d     = float(df.iloc[i].get("mom_5d", 0.0) or 0.0)
+        close_pos  = float(df.iloc[i].get("close_pos", 1.0) or 1.0)
+
+        if streak < min_days or streak > max_days:
+            continue
+
+        if ENABLE_FACTOR_FILTER:
+            # ── 大盘/趋势过滤 ──────────────────────────────────────
+            if FILTER_STOCK_ABOVE_MA20 and not above_ma20:
+                continue
+            if mom_5d < FILTER_MOMENTUM_5D:
+                continue
+
+            if FILTER_BOMB_DAY and is_bomb:
+                continue
+            if bomb_30d > FILTER_BOMB_HISTORY_MAX:
+                continue
+            if vol_ratio > FILTER_VOL_RATIO_MAX:
+                continue
+            if vol_ratio > 4.0:
+                continue  # 连板换手率过高 = 分歧大
+
+            # ── 封板强度过滤（连板要求更严：>0.90） ───────────────
+            if close_pos < 0.90:
+                continue  # 连板尾盘出货，信号更危险
+
+            # ── 股性过滤 ───────────────────────────────────────────
+            if FILTER_YIZI_BOARD and is_yizi:
+                continue
+            if avg_amt_m > 0 and avg_amt_m * 1e6 < FILTER_MIN_AVG_AMOUNT:
+                continue
+            if yizi_ratio >= FILTER_MAX_YIZI_RATIO:
+                continue
+            if avg_amp > 0 and avg_amp < 1.5:
+                continue
+
+        if i + 1 >= n:
+            break
+        nxt = df.iloc[i + 1]
+        nxt_open = float(nxt["开盘"])
+        zt_price = float(df.iloc[i].get("prev_close", 0) or 0) * 1.10
+        if nxt_open <= 0:
+            continue
+
+        # ── 入场保护：次日低开过多不追 ────────────────────────────
+        if zt_price > 0:
+            gap = (nxt_open - zt_price) / zt_price
+            if gap < ENTRY_MAX_GAP_DOWN:
+                continue
+
+        entry_p    = nxt_open * (1 + SLIP + COMMISSION)
+        entry_date = str(nxt["date"])[:10]
+        # ★ 优化⑧：传入 ATR 动态止损幅度
+        atr_stop = float(df.iloc[i].get("atr_stop_pct", STOP_LOSS) or STOP_LOSS)
+        exit_date, exit_p, reason, hdays = simulate_exit(df, i + 2, entry_p, atr_stop)
+        pnl = (exit_p - entry_p) / entry_p
+
+        trades.append(Trade(
+            code=code, strategy="连板",
+            entry_date=entry_date, entry_price=round(entry_p, 4),
+            exit_date=exit_date, exit_price=exit_p,
+            exit_reason=reason, pnl_pct=round(pnl, 4),
+            holding_days=hdays, zt_days=streak,
+            vol_ratio=round(vol_ratio, 2),
+            is_bomb_day=is_bomb,
+            bomb_30d=int(bomb_30d),
+            is_yizi=is_yizi,
+            avg_amplitude=round(avg_amp, 2),
+            avg_amount_m=round(avg_amt_m, 1),
+        ))
+
+    return trades
+
+
+# ================================================================
+# 策略3：竞价打板（细分5档子策略）
+# ================================================================
+def backtest_auction_board(code: str, df: pd.DataFrame) -> list:
+    """
+    竞价高开细分3档 × 昨日是否涨停，共5个子策略标签：
+
+    高开区间        昨日涨停    子策略标签       特点
+    ─────────────────────────────────────────────────────
+    +2%~+5%(温和)   是          竞价-连板-温和   空间最大，涨停后延续
+    +2%~+5%(温和)   否          竞价-首板-温和   随机首板，量比要求最高(≥2.5)
+    +5%~+7%(强势)   是          竞价-连板-强势   均衡空间与强度
+    +5%~+7%(强势)   否          竞价-首板-强势   随机强势高开，量比≥2.0
+    +7%~+9.9%(极限) 是          竞价-连板-极限   接近涨停，仅做昨日涨停后，封板强度要求高
+    +7%~+9.9%(极限) 否          ← 直接跳过（空间极窄却无逻辑支撑，不做）
+    ─────────────────────────────────────────────────────
+    """
+    trades = []
+    n = len(df)
+
+    for i in range(1, n - 1):
+        row      = df.iloc[i]
+        prev_row = df.iloc[i - 1]
+
+        # 节后首日不入场
+        if bool(row.get("is_post_holiday", False)):
+            continue
+
+        prev_close = float(row["prev_close"] or 0)
+        open_p     = float(row["开盘"])
+        vol_ratio  = float(row.get("vol_ratio", 1.0))
+        bomb_30d   = int(row.get("bomb_30d", 0))
+        avg_amp    = float(row.get("avg_amp_20d", 0.0) or 0.0)
+        avg_amt_m  = float(row.get("avg_amt_20d", 0.0) or 0.0)
+        above_ma20 = bool(row.get("above_ma20", True))
+        mom_5d     = float(row.get("mom_5d", 0.0) or 0.0)
+        close_pos  = float(row.get("close_pos", 1.0) or 1.0)
+        prev_is_zt = bool(prev_row["is_zt"])
+
+        if prev_close <= 0 or open_p <= 0:
+            continue
+
+        auction_chg = (open_p - prev_close) / prev_close
+
+        # ── 判断高开档位 ──────────────────────────────────────────
+        if AUCTION_MILD_LOW <= auction_chg < AUCTION_MILD_HIGH:
+            tier = "温和"       # +2%~+5%
+        elif AUCTION_STRONG_LOW <= auction_chg < AUCTION_STRONG_HIGH:
+            tier = "强势"       # +5%~+7%
+        elif AUCTION_LIMIT_LOW <= auction_chg < AUCTION_LIMIT_HIGH:
+            tier = "极限"       # +7%~+9.9%
+        else:
+            continue            # 不在任何档位内，跳过
+
+        # ── 极限高开：仅做昨日涨停后（空间极窄，无逻辑支撑不做）──
+        if tier == "极限" and not prev_is_zt:
+            continue
+
+        # ── 确定子策略标签 ────────────────────────────────────────
+        if prev_is_zt:
+            sub_strategy = f"竞价-连板-{tier}"
+        else:
+            sub_strategy = f"竞价-首板-{tier}"
+
+        # ── 过滤条件（按档位 + 昨日状态分别设置）────────────────
+        if ENABLE_FACTOR_FILTER:
+            # 通用过滤：流动性 + MA20 + 近期动量
+            if avg_amt_m > 0 and avg_amt_m * 1e6 < FILTER_MIN_AVG_AMOUNT:
+                continue
+            if FILTER_STOCK_ABOVE_MA20 and not above_ma20:
+                continue
+            if mom_5d < FILTER_MOMENTUM_5D:
+                continue
+
+            if prev_is_zt:
+                # ── 昨日涨停后竞价 ────────────────────────────────
+                if tier == "温和":
+                    # 温和高开+有涨停背景：量比要求不高，但需要封板能力
+                    if vol_ratio < VOL_RATIO_LOW:
+                        continue
+                    if bomb_30d > FILTER_BOMB_HISTORY_MAX:
+                        continue
+                    if avg_amp > 0 and (avg_amp < 1.5 or avg_amp > 6.0):  # 振幅上限6%
+                        continue
+                elif tier == "强势":
+                    # 强势高开：标准过滤
+                    if vol_ratio < VOL_RATIO_LOW:
+                        continue
+                    if bomb_30d > FILTER_BOMB_HISTORY_MAX:
+                        continue
+                    if avg_amp > 0 and (avg_amp > 6.0 or avg_amp < 1.5):  # 振幅上限6%
+                        continue
+                else:  # 极限
+                    # 极限高开：空间极窄，要求股性强（前一日封板质量高）
+                    if vol_ratio < VOL_RATIO_LOW:
+                        continue
+                    if bomb_30d > 0:           # 极限档零容忍炸板
+                        continue
+                    if close_pos < 0.85:       # 昨日收盘必须接近最高价（封板牢固）
+                        continue
+            else:
+                # ── 随机首板竞价（无涨停背景，过滤更严）────────────
+                if bomb_30d > 0:               # 首板竞价零容忍炸板历史
+                    continue
+                if vol_ratio < VOL_RATIO_LOW:  # 量比必须≥3
+                    continue
+                if avg_amp > 0 and (avg_amp < 1.5 or avg_amp > 4.0):
+                    continue
+                if tier == "温和":
+                    # 温和高开无涨停背景：量比要求最高（必须有资金强烈介入）
+                    if vol_ratio < 2.5:
+                        continue
+                else:  # 强势（极限已在上方被过滤掉）
+                    if vol_ratio < 2.0:
+                        continue
+
+        entry_p    = round(open_p * (1 + SLIP + COMMISSION), 4)
+        entry_date = str(row["date"])[:10]
+        # ★ 优化⑧：传入 ATR 动态止损幅度
+        atr_stop = float(row.get("atr_stop_pct", STOP_LOSS) or STOP_LOSS)
+        exit_date, exit_p, reason, hdays = simulate_exit(df, i + 1, entry_p, atr_stop)
+        pnl = (exit_p - entry_p) / entry_p
+
+        trades.append(Trade(
+            code=code, strategy=sub_strategy,
+            entry_date=entry_date, entry_price=entry_p,
+            exit_date=exit_date, exit_price=exit_p,
+            exit_reason=reason, pnl_pct=round(pnl, 4),
+            holding_days=hdays, zt_days=0,
+            vol_ratio=round(vol_ratio, 2),
+            bomb_30d=int(bomb_30d),
+            avg_amplitude=round(avg_amp, 2),
+            avg_amount_m=round(avg_amt_m, 1),
+        ))
+
+    return trades
+
+
+# ================================================================
+# 策略4：跌停反包
+# ================================================================
+def backtest_dt_recover(code: str, df: pd.DataFrame) -> list:
+    """
+    信号：昨日跌停，今日开盘相对昨收涨幅 ≥ 3%（情绪修复）
+    """
+    trades = []
+    n = len(df)
+
+    for i in range(1, n - 1):
+        row      = df.iloc[i]
+        prev_row = df.iloc[i - 1]
+
+        # 节后首日不入场
+        if bool(row.get("is_post_holiday", False)):
+            continue
+
+        if not prev_row["is_dt"]:
+            continue
+
+        prev_close = float(row["prev_close"] or 0)
+        open_p     = float(row["开盘"])
+        vol_ratio  = float(row.get("vol_ratio", 1.0))
+
+        if prev_close <= 0 or open_p <= 0:
+            continue
+
+        open_chg = (open_p - prev_close) / prev_close
+        if open_chg < 0.03:
+            continue
+
+        # ── 反包过滤：量比≥1.5 + 振幅1.5~6% + 炸板历史 ──────────
+        if vol_ratio < VOL_RATIO_LOW:
+            continue
+        avg_amp  = float(row.get("avg_amp_20d", 0.0) or 0.0)
+        bomb_30d = int(row.get("bomb_30d", 0))
+        avg_amt_m = float(row.get("avg_amt_20d", 0.0) or 0.0)
+        if avg_amp > 0 and (avg_amp < 1.5 or avg_amp > 6.0):  # 振幅上限6%
+            continue
+        if bomb_30d > FILTER_BOMB_HISTORY_MAX:       # 反包也要求炸板干净
+            continue
+        if avg_amt_m > 0 and avg_amt_m * 1e6 < FILTER_MIN_AVG_AMOUNT:
+            continue
+
+        entry_p    = round(open_p * (1 + SLIP + COMMISSION), 4)
+        entry_date = str(row["date"])[:10]
+        # ★ 优化⑧：传入 ATR 动态止损幅度
+        atr_stop = float(row.get("atr_stop_pct", STOP_LOSS) or STOP_LOSS)
+        exit_date, exit_p, reason, hdays = simulate_exit(df, i + 1, entry_p, atr_stop)
+        pnl = (exit_p - entry_p) / entry_p
+
+        trades.append(Trade(
+            code=code, strategy="反包",
+            entry_date=entry_date, entry_price=entry_p,
+            exit_date=exit_date, exit_price=exit_p,
+            exit_reason=reason, pnl_pct=round(pnl, 4),
+            holding_days=hdays, zt_days=-1,
+            vol_ratio=round(vol_ratio, 2),
+        ))
+
+    return trades
+
+
+# ================================================================
+# 单股回测（汇总四策略）
+# ================================================================
+def backtest_single(code: str, df: pd.DataFrame,
+                    strategies: list = None) -> list:
+    if strategies is None:
+        strategies = STRATEGIES_ALL
+    trades = []
+    if "首板" in strategies:
+        trades += backtest_first_board(code, df)
+    if "连板" in strategies:
+        trades += backtest_connect_board(code, df)
+    if "竞价" in strategies:
+        trades += backtest_auction_board(code, df)
+    if "反包" in strategies:
+        trades += backtest_dt_recover(code, df)
+    return trades
+
+
+# ================================================================
+# 统计
+# ================================================================
+def calc_stats(trades: list, bt_start: str = "", bt_end: str = "") -> dict:
+    if not trades:
+        return {}
+
+    df = pd.DataFrame([t.__dict__ for t in trades])
+    df = df.sort_values("entry_date").reset_index(drop=True)
+
+    total    = len(df)
+    wins     = df[df["pnl_pct"] > 0]
+    losses   = df[df["pnl_pct"] <= 0]
+    win_rate = len(wins) / total
+    avg_pnl  = df["pnl_pct"].mean()
+    avg_win  = wins["pnl_pct"].mean()  if len(wins)   else 0
+    avg_loss = losses["pnl_pct"].mean() if len(losses) else 0
+    pnl_ratio = abs(avg_win / avg_loss) if avg_loss != 0 else float("inf")
+
+    # ★ v4.0：资金管理净值曲线（固定仓位 POSITION_SIZE，最多 MAX_POSITIONS 同时持仓）
+    # 按入场日排序，模拟资金变化，每笔使用 POSITION_SIZE 比例资金
+    equity_curve = _calc_portfolio_equity(df)
+    if len(equity_curve) > 0:
+        peak   = equity_curve.cummax()
+        max_dd = float(((equity_curve - peak) / peak).min())
+    else:
+        # 退化：独立复利（旧逻辑，不推荐）
+        equity_curve = (1 + df["pnl_pct"]).cumprod()
+        peak   = equity_curve.cummax()
+        max_dd = float(((equity_curve - peak) / peak).min())
+
+    if len(df) > 1:
+        # ★ 年化收益修复：优先用命令行传入的回测区间（bt_start/bt_end）
+        if bt_start and bt_end:
+            try:
+                span_days = (pd.to_datetime(bt_end) - pd.to_datetime(bt_start)).days
+                years = max(span_days / 365.25, 0.5)
+            except Exception:
+                years = max((pd.to_datetime(df["entry_date"].iloc[-1]) -
+                             pd.to_datetime(df["entry_date"].iloc[0])).days / 365.25, 0.5)
+        else:
+            years = max((pd.to_datetime(df["entry_date"].iloc[-1]) -
+                         pd.to_datetime(df["entry_date"].iloc[0])).days / 365.25, 0.5)
+        final_equity = float(equity_curve.iloc[-1])
+        annual_ret = final_equity ** (1.0 / years) - 1
+        # 防止极端值（年化超过500%时输出警告并截断显示）
+        if abs(annual_ret) > 5.0:
+            log.warning(f"年化收益异常（{annual_ret:+.0%}），样本量可能不足，请增加股票数或拉长回测区间")
+            annual_ret = min(annual_ret, 5.0)
+    else:
+        annual_ret = avg_pnl
+
+    # ★ v3.4修复：夏普年化因子用实际平均持仓天数
+    if "holding_days" in df.columns and df["holding_days"].mean() > 0:
+        avg_hold = max(1, float(df["holding_days"].mean()))
+    elif "hold_days" in df.columns and df["hold_days"].mean() > 0:
+        avg_hold = max(1, float(df["hold_days"].mean()))
+    else:
+        avg_hold = float(HOLD_DAYS)
+    trades_per_year = 250.0 / avg_hold
+    rf = 0.025 / trades_per_year
+    excess = df["pnl_pct"] - rf
+    sharpe = excess.mean() / excess.std() * np.sqrt(trades_per_year) if excess.std() > 0 else 0
+
+    # 按策略分组统计
+    # ★ 修复：竞价子策略标签为 "竞价-连板-强势" 等，用前缀匹配归组
+    # 统计维度1：顶层策略（首板/连板/竞价/反包）合并
+    # 统计维度2：竞价各子策略单独列出
+    strategy_stats = {}
+
+    # 顶层策略合并统计
+    for st in STRATEGIES_ALL:
+        if st == "竞价":
+            sub = df[df["strategy"].str.startswith("竞价")]
+        else:
+            sub = df[df["strategy"] == st]
+        if len(sub) == 0:
+            continue
+        strategy_stats[st] = {
+            "count":    len(sub),
+            "win_rate": round(len(sub[sub["pnl_pct"] > 0]) / len(sub), 3),
+            "avg_pnl":  round(sub["pnl_pct"].mean(), 4),
+            "avg_win":  round(sub[sub["pnl_pct"] > 0]["pnl_pct"].mean(), 4) if len(sub[sub["pnl_pct"] > 0]) else 0,
+            "avg_loss": round(sub[sub["pnl_pct"] <= 0]["pnl_pct"].mean(), 4) if len(sub[sub["pnl_pct"] <= 0]) else 0,
+        }
+
+    # 竞价子策略单独统计（细分5档）
+    auction_sub_stats = {}
+    auction_subs = sorted(df[df["strategy"].str.startswith("竞价")]["strategy"].unique())
+    for sub_st in auction_subs:
+        sub = df[df["strategy"] == sub_st]
+        if len(sub) == 0:
+            continue
+        auction_sub_stats[sub_st] = {
+            "count":    len(sub),
+            "win_rate": round(len(sub[sub["pnl_pct"] > 0]) / len(sub), 3),
+            "avg_pnl":  round(sub["pnl_pct"].mean(), 4),
+            "avg_win":  round(sub[sub["pnl_pct"] > 0]["pnl_pct"].mean(), 4) if len(sub[sub["pnl_pct"] > 0]) else 0,
+            "avg_loss": round(sub[sub["pnl_pct"] <= 0]["pnl_pct"].mean(), 4) if len(sub[sub["pnl_pct"] <= 0]) else 0,
+        }
+
+    # 连板天数分组（连板策略）
+    zt_stats = {}
+    lp = df[df["strategy"] == "连板"]
+    for days in sorted(lp["zt_days"].unique()):
+        sub = lp[lp["zt_days"] == days]
+        zt_stats[int(days)] = {
+            "count":    len(sub),
+            "win_rate": round(len(sub[sub["pnl_pct"] > 0]) / len(sub), 3),
+            "avg_pnl":  round(sub["pnl_pct"].mean(), 4),
+        }
+
+    # ★ v4.0：连续亏损统计
+    max_consec_loss = _calc_max_consecutive_loss(df)
+
+    # ★ v4.0：按年度统计
+    yearly_stats = _calc_yearly_stats(df)
+
+    # ★ v4.0：按月度统计
+    monthly_stats = _calc_monthly_stats(df)
+
+    return {
+        "total": total, "win_rate": round(win_rate, 4),
+        "avg_pnl": round(avg_pnl, 4), "avg_win": round(avg_win, 4),
+        "avg_loss": round(avg_loss, 4), "pnl_ratio": round(pnl_ratio, 2),
+        "max_drawdown": round(max_dd, 4),
+        "annual_return": round(annual_ret, 4), "sharpe": round(sharpe, 2),
+        "strategy_stats": strategy_stats, "zt_stats": zt_stats,
+        "auction_sub_stats": auction_sub_stats,
+        "exit_reasons": df["exit_reason"].value_counts().to_dict(),
+        "max_consec_loss": max_consec_loss,
+        "yearly_stats": yearly_stats,
+        "monthly_stats": monthly_stats,
+        "equity_curve": equity_curve,  # 供画图使用
+    }
+
+
+def _calc_portfolio_equity(df: pd.DataFrame) -> pd.Series:
+    """
+    ★ v4.0：固定仓位资金管理净值曲线
+    每笔交易使用 POSITION_SIZE（10%）仓位，最多同时 MAX_POSITIONS（10）只
+    同日信号按 vol_ratio 从高到低排序，超过仓位上限的跳过
+    返回：以交易笔数为索引的净值序列（初始=1.0）
+    """
+    if df.empty:
+        return pd.Series([1.0])
+
+    df = df.sort_values("entry_date").reset_index(drop=True)
+
+    capital = INITIAL_CAPITAL
+    equity_list = [capital]
+
+    # 按出场日分组，模拟资金流入流出
+    # 简化模型：每笔独立，但资金有限（最多同时10笔×10%=100%）
+    # 用队列模拟并发持仓
+    active_positions = []  # (exit_date, pnl_pct, capital_used)
+    daily_capital = capital  # 当前可用资金
+
+    for _, row in df.iterrows():
+        entry_date = row["entry_date"]
+        exit_date  = row["exit_date"] if row["exit_date"] else entry_date
+        pnl_pct    = float(row["pnl_pct"])
+
+        # 结算已出场的仓位（出场日 <= 入场日的）
+        still_active = []
+        for pos in active_positions:
+            if pos["exit_date"] <= entry_date:
+                # 资金回笼（含盈亏）
+                daily_capital += pos["capital_used"] * (1 + pos["pnl_pct"])
+            else:
+                still_active.append(pos)
+        active_positions = still_active
+
+        # 判断是否还有仓位空间
+        if len(active_positions) >= MAX_POSITIONS:
+            continue  # 已满仓，跳过此信号
+
+        # 计算本笔仓位金额
+        pos_capital = min(daily_capital * POSITION_SIZE, daily_capital / max(1, MAX_POSITIONS - len(active_positions)))
+        if pos_capital <= 0:
+            continue
+
+        daily_capital -= pos_capital
+        active_positions.append({
+            "exit_date":    exit_date,
+            "pnl_pct":      pnl_pct,
+            "capital_used": pos_capital,
+        })
+        equity_list.append(daily_capital + sum(p["capital_used"] for p in active_positions))
+
+    # 结算所有剩余仓位
+    for pos in active_positions:
+        daily_capital += pos["capital_used"] * (1 + pos["pnl_pct"])
+    equity_list.append(daily_capital)
+
+    equity_arr = pd.Series(equity_list) / INITIAL_CAPITAL
+    return equity_arr
+
+
+def _calc_max_consecutive_loss(df: pd.DataFrame) -> dict:
+    """★ v4.0：统计最大连续亏损笔数和最大连续亏损幅度（乘以仓位比例）"""
+    pnls = df.sort_values("entry_date")["pnl_pct"].tolist()
+    max_streak = 0
+    cur_streak = 0
+    max_loss_sum = 0.0
+    cur_loss_sum = 0.0
+    for p in pnls:
+        if p <= 0:
+            cur_streak += 1
+            cur_loss_sum += p * POSITION_SIZE  # 乘仓位比例，反映真实资金损失
+            if cur_streak > max_streak:
+                max_streak = cur_streak
+                max_loss_sum = cur_loss_sum
+        else:
+            cur_streak = 0
+            cur_loss_sum = 0.0
+    return {"max_streak": max_streak, "max_loss_sum": round(max_loss_sum, 4)}
+
+
+def _calc_yearly_stats(df: pd.DataFrame) -> dict:
+    """★ v4.0：按年度统计胜率/均收益"""
+    df = df.copy()
+    df["year"] = pd.to_datetime(df["entry_date"]).dt.year
+    result = {}
+    for yr in sorted(df["year"].unique()):
+        sub = df[df["year"] == yr]
+        wins = sub[sub["pnl_pct"] > 0]
+        # 年度累计收益：每笔 POSITION_SIZE 仓位，线性叠加
+        # 公式：sum(pnl_pct * POSITION_SIZE)，与资金曲线计算保持一致
+        total_ret = float((sub["pnl_pct"] * POSITION_SIZE).sum())
+        result[int(yr)] = {
+            "count":    len(sub),
+            "win_rate": round(len(wins) / len(sub), 3),
+            "avg_pnl":  round(sub["pnl_pct"].mean(), 4),
+            "total_ret": round(total_ret, 4),
+        }
+    return result
+
+
+def _calc_monthly_stats(df: pd.DataFrame) -> dict:
+    """★ v4.0：按月度统计胜率/均收益（用于发现季节性规律）"""
+    df = df.copy()
+    df["month"] = pd.to_datetime(df["entry_date"]).dt.month
+    result = {}
+    for mo in range(1, 13):
+        sub = df[df["month"] == mo]
+        if len(sub) == 0:
+            continue
+        wins = sub[sub["pnl_pct"] > 0]
+        result[int(mo)] = {
+            "count":    len(sub),
+            "win_rate": round(len(wins) / len(sub), 3),
+            "avg_pnl":  round(sub["pnl_pct"].mean(), 4),
+        }
+    return result
+
+
+# ================================================================
+# 打印报告
+# ================================================================
+def print_report(stats: dict, trades: list) -> None:
+    if not stats:
+        print("无交易记录")
+        return
+
+    print("\n" + "="*70)
+    print("  打板策略 · 历史回测报告")
+    print("="*70)
+    print(f"  总交易笔数      : {stats['total']}")
+    print(f"  整体胜率        : {stats['win_rate']:.1%}")
+    print(f"  平均每笔收益    : {stats['avg_pnl']:+.2%}")
+    print(f"  平均盈利        : {stats['avg_win']:+.2%}")
+    print(f"  平均亏损        : {stats['avg_loss']:+.2%}")
+    print(f"  盈亏比          : {stats['pnl_ratio']:.2f}x")
+    print(f"  最大回撤        : {stats['max_drawdown']:.2%}")
+    print(f"  年化收益（估）  : {stats['annual_return']:+.2%}")
+    print(f"  夏普比率（估）  : {stats['sharpe']:.2f}")
+
+    print("\n  ── 各策略分类统计 ──")
+    print(f"  {'策略':<8}{'笔数':>6}{'胜率':>8}{'均收益':>9}{'均盈利':>9}{'均亏损':>9}")
+    print("  " + "-"*52)
+    for st, s in stats.get("strategy_stats", {}).items():
+        icon = {"首板": "🔥", "连板": "🚀", "竞价": "⚡", "反包": "🔄"}.get(st, "")
+        print(
+            f"  {icon}{st:<6}{s['count']:>6}  {s['win_rate']:>6.1%}"
+            f"  {s['avg_pnl']:>+7.2%}  {s['avg_win']:>+7.2%}  {s['avg_loss']:>+7.2%}"
+        )
+
+    # ★ 竞价子策略细分展示
+    auction_sub = stats.get("auction_sub_stats", {})
+    if auction_sub:
+        print("\n  ── 竞价子策略细分 ──")
+        print(f"  {'子策略':<18}{'笔数':>6}{'胜率':>8}{'均收益':>9}{'均盈利':>9}{'均亏损':>9}")
+        print("  " + "-"*62)
+        for sub_st, s in auction_sub.items():
+            print(
+                f"  {'⚡'+sub_st:<18}{s['count']:>6}  {s['win_rate']:>6.1%}"
+                f"  {s['avg_pnl']:>+7.2%}  {s['avg_win']:>+7.2%}  {s['avg_loss']:>+7.2%}"
+            )
+
+    lp_stats = stats.get("zt_stats", {})
+    if lp_stats:
+        print("\n  ── 连板天数细分（连板策略）──")
+        print(f"  {'连板天数':<10}{'笔数':>6}{'胜率':>8}{'均收益':>9}")
+        print("  " + "-"*36)
+        for days, s in lp_stats.items():
+            print(f"  {days}连板{'':<6}{s['count']:>6}  {s['win_rate']:>6.1%}  {s['avg_pnl']:>+7.2%}")
+
+    print("\n  ── 出场原因分布 ──")
+    label_map = {
+        "stop_loss":  "ATR止损",
+        "time_stop":  "时间止损",
+        "gap_abort":  "低开止损",
+        "ma5_stop":   "均线止损(旧)",   # 兼容旧数据
+        "ma10_stop":  "MA10趋势止损",   # v4.0新标签
+        "trail_stop": "跟踪止盈",
+        "t2_trail":   "T2追踪止盈",
+        "target1":    "第一止盈",
+        "target2":    "第二止盈",
+        "timeout":    "超时平仓",
+    }
+    for reason, cnt in stats.get("exit_reasons", {}).items():
+        pct   = cnt / stats["total"]
+        label = label_map.get(reason, reason)
+        is_win = reason in ("target1", "target2", "trail_stop", "t2_trail", "timeout", "ma10_stop")
+        icon  = "✅" if is_win else "❌"
+        print(f"  {icon} {label:<12}: {cnt:>4}笔 ({pct:.1%})")
+
+    print("="*70)
+
+    # 最近20笔明细
+    if trades:
+        recent = sorted(trades, key=lambda t: t.entry_date, reverse=True)[:20]
+        print(f"\n  最近 {len(recent)} 笔交易明细：")
+        print(f"  {'代码':<10}{'入场日':>12}{'出场日':>12}{'策略':>6}"
+              f"{'收益率':>9}{'持天':>6}{'出场原因':<12}")
+        print("  " + "-"*68)
+        for t in recent:
+            icon = "✅" if t.pnl_pct > 0 else "❌"
+            print(
+                f"  {t.code:<10}{t.entry_date:>12}{t.exit_date:>12}"
+                f"  {t.strategy:<4}  {t.pnl_pct:>+.2%}"
+                f"{t.holding_days:>6}  {icon}{t.exit_reason}"
+            )
+
+    # ★ v4.0：连续亏损统计
+    consec = stats.get("max_consec_loss", {})
+    if consec:
+        print(f"\n  ── 风险指标（v4.0新增）──")
+        print(f"  最大连续亏损笔数  : {consec.get('max_streak', 0)} 笔")
+        print(f"  最大连续亏损累计  : {consec.get('max_loss_sum', 0):+.2%}")
+        print(f"  资金管理说明      : 每笔 {POSITION_SIZE:.0%} 仓位，最多 {MAX_POSITIONS} 只同持")
+        print(f"  注：量比为日线近似值（非真实盘中量比），换手率用量比替代（实盘需实际数据）")
+
+    # ★ v4.0：按年度统计
+    yearly = stats.get("yearly_stats", {})
+    if yearly:
+        print(f"\n  ── 按年度统计（验证策略跨周期稳定性）──")
+        print(f"  {'年份':<6}{'笔数':>6}{'胜率':>8}{'均收益':>9}{'年度累计':>10}")
+        print("  " + "-"*42)
+        for yr, s in yearly.items():
+            print(
+                f"  {yr:<6}{s['count']:>6}  {s['win_rate']:>6.1%}"
+                f"  {s['avg_pnl']:>+7.2%}  {s['total_ret']:>+8.2%}"
+            )
+
+    # ★ v4.0：按月度统计
+    monthly = stats.get("monthly_stats", {})
+    if monthly:
+        month_names = {1:"1月",2:"2月",3:"3月",4:"4月",5:"5月",6:"6月",
+                       7:"7月",8:"8月",9:"9月",10:"10月",11:"11月",12:"12月"}
+        print(f"\n  ── 按月度统计（发现季节性规律）──")
+        print(f"  {'月份':<6}{'笔数':>6}{'胜率':>8}{'均收益':>9}")
+        print("  " + "-"*32)
+        for mo, s in monthly.items():
+            print(
+                f"  {month_names.get(mo, str(mo)):<6}{s['count']:>6}"
+                f"  {s['win_rate']:>6.1%}  {s['avg_pnl']:>+7.2%}"
+            )
+
+    print()
+
+
+def factor_analysis_report(trades: list) -> None:
+    """
+    分因子胜率分析：
+      - 量比分组（<1.5 / 1.5~3.0 / >3.0）
+      - 连板天数分组（1/2/3/4+）
+      - 炸板历史分组（0次 / 1次 / >1次）—— 验证假涨停识别有效性
+    """
+    if not trades:
+        return
+    df = pd.DataFrame([t.__dict__ for t in trades])
+    df = df.sort_values("entry_date").reset_index(drop=True)
+
+    print("\n" + "="*70)
+    print("  因子分析报告（验证多因子过滤有效性）")
+    print("  ⚠️  注意：量比为日线5日均量近似值，非真实盘中量比；换手率字段用量比替代")
+    print("="*70)
+
+    # ── 量比分组 ──
+    def vol_bucket(vr):
+        if vr < 1.5: return "低(<1.5)"
+        if vr <= 3.0: return "优(1.5~3)"
+        return "高(>3)"
+
+    df["vol_bucket"] = df["vol_ratio"].apply(vol_bucket)
+    print("\n  ── 量比分组胜率 ──")
+    print(f"  {'区间':<12}{'笔数':>6}{'胜率':>8}{'均收益':>9}{'均盈利':>9}{'均亏损':>9}")
+    print("  " + "-"*56)
+    for bucket in ["低(<1.5)", "优(1.5~3)", "高(>3)"]:
+        sub = df[df["vol_bucket"] == bucket]
+        if len(sub) == 0: continue
+        wins = sub[sub["pnl_pct"] > 0]
+        loss = sub[sub["pnl_pct"] <= 0]
+        print(
+            f"  {bucket:<12}{len(sub):>6}  "
+            f"{len(wins)/len(sub):>6.1%}  "
+            f"{sub['pnl_pct'].mean():>+7.2%}  "
+            f"{wins['pnl_pct'].mean() if len(wins) else 0:>+7.2%}  "
+            f"{loss['pnl_pct'].mean() if len(loss) else 0:>+7.2%}"
+        )
+
+    # ── 炸板历史分组（验证假涨停过滤有效性）──
+    if "bomb_30d" in df.columns:
+        print("\n  ── 近30日炸板次数分组胜率（验证假涨停过滤有效性）──")
+        print(f"  {'炸板次数':<12}{'笔数':>6}{'胜率':>8}{'均收益':>9}")
+        print("  " + "-"*38)
+        for label, cond in [("0次(干净)", df["bomb_30d"] == 0),
+                             ("1次(谨慎)", df["bomb_30d"] == 1),
+                             ("≥2次(危险)", df["bomb_30d"] >= 2)]:
+            sub = df[cond]
+            if len(sub) == 0: continue
+            wins = sub[sub["pnl_pct"] > 0]
+            print(
+                f"  {label:<12}{len(sub):>6}  "
+                f"{len(wins)/len(sub):>6.1%}  "
+                f"{sub['pnl_pct'].mean():>+7.2%}"
+            )
+        # 提示：≥2次组胜率应明显低于0次组，验证过滤有效性
+        clean = df[df["bomb_30d"] == 0]
+        risky = df[df["bomb_30d"] >= 2]
+        if len(clean) > 5 and len(risky) > 5:
+            delta = clean["pnl_pct"].mean() - risky["pnl_pct"].mean()
+            print(f"\n  → 过滤炸板历史的收益提升：+{delta:.2%}（{delta>0 and '过滤有效' or '过滤无效，可关闭'}）")
+
+    # ── 连板天数分组（仅首板+连板策略）──
+    board_df = df[df["strategy"].isin(["首板", "连板"])]
+    if not board_df.empty:
+        print("\n  ── 连板天数分组胜率（首板+连板） ──")
+        print(f"  {'连板天数':<10}{'笔数':>6}{'胜率':>8}{'均收益':>9}")
+        print("  " + "-"*36)
+        for days in sorted(board_df["zt_days"].unique()):
+            sub = board_df[board_df["zt_days"] == days]
+            wins = sub[sub["pnl_pct"] > 0]
+            label = f"{days}板" if days > 0 else "反包"
+            print(
+                f"  {label:<10}{len(sub):>6}  "
+                f"{len(wins)/len(sub):>6.1%}  "
+                f"{sub['pnl_pct'].mean():>+7.2%}"
+            )
+
+    # ── 股性分析：日均振幅分组 ──
+    if "avg_amplitude" in df.columns:
+        def amp_bucket(a):
+            if a <= 0:     return "未知"
+            if a < 1.5:    return "迟钝(<1.5%)"
+            if a < 3.0:    return "普通(1.5~3%)"
+            if a < 5.0:    return "活跃(3~5%)"
+            return "超活跃(>5%)"
+
+        df["amp_bucket"] = df["avg_amplitude"].apply(amp_bucket)
+        print("\n  ── 股性·日均振幅分组胜率（验证活跃度对打板胜率影响）──")
+        print(f"  {'振幅区间':<16}{'笔数':>6}{'胜率':>8}{'均收益':>9}")
+        print("  " + "-"*42)
+        for bucket in ["迟钝(<1.5%)", "普通(1.5~3%)", "活跃(3~5%)", "超活跃(>5%)"]:
+            sub = df[df["amp_bucket"] == bucket]
+            if len(sub) == 0: continue
+            wins = sub[sub["pnl_pct"] > 0]
+            print(
+                f"  {bucket:<16}{len(sub):>6}  "
+                f"{len(wins)/len(sub):>6.1%}  "
+                f"{sub['pnl_pct'].mean():>+7.2%}"
+            )
+        # 提示结论
+        active = df[df["avg_amplitude"] >= 3.0]
+        dull   = df[df["avg_amplitude"].between(0.1, 1.5)]
+        if len(active) >= 5 and len(dull) >= 5:
+            delta = active["pnl_pct"].mean() - dull["pnl_pct"].mean()
+            print(f"\n  → 活跃股vs迟钝股收益差：{delta:+.2%}"
+                  f"（{'活跃股胜率更高，优先选活跃股' if delta > 0 else '差异不显著'}）")
+
+    # ── 策略 × 量比 交叉表 ──
+    print("\n  ── 策略 × 量比 交叉胜率 ──")
+    print(f"  {'策略':<8}", end="")
+    buckets = ["低(<1.5)", "优(1.5~3)", "高(>3)"]
+    for b in buckets:
+        print(f"  {b:>12}", end="")
+    print()
+    print("  " + "-"*52)
+    for st in STRATEGIES_ALL:
+        if st == "竞价":
+            sub_st_df = df[df["strategy"].str.startswith("竞价")]
+        else:
+            sub_st_df = df[df["strategy"] == st]
+        if len(sub_st_df) == 0:
+            continue
+        print(f"  {st:<8}", end="")
+        for b in buckets:
+            sub = sub_st_df[sub_st_df["vol_bucket"] == b]
+            if len(sub) == 0:
+                print(f"  {'  -':>12}", end="")
+            else:
+                wr = len(sub[sub["pnl_pct"] > 0]) / len(sub)
+                print(f"  {wr:>11.1%}", end="")
+        print()
+
+    print()
+
+
+def save_csv(trades: list, path: str = "daban_trades.csv") -> None:
+    if not trades:
+        return
+    fields = list(trades[0].__dict__.keys())
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        for t in trades:
+            writer.writerow(t.__dict__)
+    log.info(f"交易明细已保存到 {path}")
+
+
+# ================================================================
+# Server酱推送
+# ================================================================
+def push_serverchan(stats: dict, trades: list,
+                    sendkey: str = "",
+                    bt_start: str = "", bt_end: str = "") -> None:
+    """
+    回测完成后通过 Server酱 推送摘要到微信。
+    sendkey 优先从参数取，为空时读环境变量 SENDKEY。
+    """
+    import urllib.request
+    import urllib.parse
+
+    key = sendkey or os.environ.get("SENDKEY", "")
+    if not key:
+        log.info("未配置 SENDKEY，跳过 Server酱推送")
+        return
+
+    if not stats:
+        log.info("无回测结果，跳过推送")
+        return
+
+    total    = stats.get("total", 0)
+    wr       = stats.get("win_rate", 0)
+    avg_pnl  = stats.get("avg_pnl", 0)
+    avg_win  = stats.get("avg_win", 0)
+    avg_loss = stats.get("avg_loss", 0)
+    pnl_r    = stats.get("pnl_ratio", 0)
+    max_dd   = stats.get("max_drawdown", 0)
+    ann_ret  = stats.get("annual_return", 0)
+    sharpe   = stats.get("sharpe", 0)
+
+    # ── 各策略摘要 ──
+    st_lines = []
+    for st, s in stats.get("strategy_stats", {}).items():
+        st_lines.append(
+            f"- {st}：{s['count']}笔  胜率{s['win_rate']:.1%}  "
+            f"均收{s['avg_pnl']:+.2%}"
+        )
+    # 竞价子策略细分
+    for sub_st, s in stats.get("auction_sub_stats", {}).items():
+        st_lines.append(
+            f"  - {sub_st}：{s['count']}笔  胜率{s['win_rate']:.1%}  "
+            f"均收{s['avg_pnl']:+.2%}"
+        )
+
+    # ── 年度摘要（最近3年）──
+    yearly = stats.get("yearly_stats", {})
+    yr_lines = []
+    for yr, s in list(yearly.items())[-3:]:
+        yr_lines.append(
+            f"- {yr}年：{s['count']}笔  胜率{s['win_rate']:.1%}  "
+            f"累计{s['total_ret']:+.2%}"
+        )
+
+    # ── 连续亏损 ──
+    consec = stats.get("max_consec_loss", {})
+    consec_line = (
+        f"最大连亏：{consec.get('max_streak', 0)}笔 / "
+        f"累计{consec.get('max_loss_sum', 0):+.2%}"
+    )
+
+    date_range = f"{bt_start} ~ {bt_end}" if bt_start and bt_end else "自定义区间"
+
+    title = f"打板回测完成 | 胜率{wr:.1%} 年化{ann_ret:+.2%}"
+
+    body = f"""## 打板策略 · 历史回测报告
+
+**回测区间**：{date_range}
+
+| 指标 | 数值 |
+|------|------|
+| 总交易笔数 | {total} |
+| 整体胜率 | {wr:.1%} |
+| 平均每笔收益 | {avg_pnl:+.2%} |
+| 平均盈利 | {avg_win:+.2%} |
+| 平均亏损 | {avg_loss:+.2%} |
+| 盈亏比 | {pnl_r:.2f}x |
+| 最大回撤 | {max_dd:.2%} |
+| 年化收益（估） | {ann_ret:+.2%} |
+| 夏普比率（估） | {sharpe:.2f} |
+
+### 各策略分类
+{chr(10).join(st_lines) if st_lines else "（无数据）"}
+
+### 近年度表现
+{chr(10).join(yr_lines) if yr_lines else "（无数据）"}
+
+### 风险指标
+{consec_line}
+资金管理：每笔 {POSITION_SIZE:.0%} 仓位，最多 {MAX_POSITIONS} 只同持
+"""
+
+    # Server酱 SCKEY / SCT 两种 key 格式兼容
+    if key.startswith("SCT"):
+        url = f"https://sctapi.ftqq.com/{key}.send"
+    else:
+        url = f"https://sc.ftqq.com/{key}.send"
+
+    data = urllib.parse.urlencode({
+        "title": title,
+        "desp":  body,
+    }).encode("utf-8")
+
+    try:
+        req = urllib.request.Request(url, data=data, method="POST")
+        req.add_header("Content-Type", "application/x-www-form-urlencoded")
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            result = resp.read().decode("utf-8")
+        log.info(f"Server酱推送成功: {result[:80]}")
+    except Exception as e:
+        log.warning(f"Server酱推送失败（不影响回测结果）: {e}")
+
+
+def plot_equity(trades: list, stats: dict) -> None:
+    try:
+        import matplotlib
+        matplotlib.use("Agg")   # 非交互后端，不弹窗，支持无显示器环境
+        import matplotlib.pyplot as plt
+        matplotlib.rcParams["font.sans-serif"] = ["SimHei", "Arial Unicode MS", "DejaVu Sans"]
+        matplotlib.rcParams["axes.unicode_minus"] = False
+    except ImportError:
+        log.warning("matplotlib 未安装，跳过画图")
+        return
+
+    if not trades:
+        return
+
+    df = pd.DataFrame([t.__dict__ for t in trades])
+    df = df.sort_values("entry_date").reset_index(drop=True)
+
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    fig.suptitle("打板策略 · 回测分析 (v4.0 资金管理版)", fontsize=14)
+
+    # 1. ★ v4.0：资金管理净值曲线（固定仓位）
+    equity_curve = stats.get("equity_curve", None)
+    if equity_curve is None or len(equity_curve) < 2:
+        equity_curve = (1 + df["pnl_pct"]).cumprod()
+    axes[0, 0].plot(equity_curve.values, color="steelblue", linewidth=1.5)
+    axes[0, 0].axhline(1, color="gray", linestyle="--", linewidth=0.8)
+    axes[0, 0].fill_between(range(len(equity_curve)), 1, equity_curve.values,
+                             where=(equity_curve.values >= 1), alpha=0.15, color="green")
+    axes[0, 0].fill_between(range(len(equity_curve)), 1, equity_curve.values,
+                             where=(equity_curve.values < 1), alpha=0.15, color="red")
+    max_dd = stats.get("max_drawdown", 0)
+    axes[0, 0].set_title(f"资金净值曲线（{POSITION_SIZE:.0%}仓位×{MAX_POSITIONS}只，最大回撤{max_dd:.1%}）")
+    axes[0, 0].set_xlabel("交易笔数"); axes[0, 0].set_ylabel("净值")
+
+    # 2. 各策略胜率对比
+    st_data  = stats.get("strategy_stats", {})
+    if st_data:
+        names = list(st_data.keys())
+        wrs   = [st_data[k]["win_rate"] for k in names]
+        apnls = [st_data[k]["avg_pnl"]  for k in names]
+        x     = np.arange(len(names))
+        w     = 0.35
+        axes[0, 1].bar(x - w/2, wrs, w, label="胜率", color="#5FA8D3")
+        axes[0, 1].axhline(0.5, color="red", linestyle="--", linewidth=0.8)
+        ax2 = axes[0, 1].twinx()
+        ax2.bar(x + w/2, [v * 100 for v in apnls], w, label="均收益(%)", color="#FB923C", alpha=0.7)
+        ax2.axhline(0, color="gray", linestyle=":", linewidth=0.6)
+        axes[0, 1].set_xticks(x); axes[0, 1].set_xticklabels(names)
+        axes[0, 1].set_title("各策略胜率 vs 均收益")
+        axes[0, 1].set_ylim(0, 1)
+        axes[0, 1].legend(loc="upper left"); ax2.legend(loc="upper right")
+
+    # 3. 每笔收益分布
+    axes[0, 2].hist(df["pnl_pct"] * 100, bins=40, color="steelblue",
+                    edgecolor="white", linewidth=0.5)
+    axes[0, 2].axvline(0, color="red", linestyle="--", linewidth=0.8)
+    axes[0, 2].axvline(df["pnl_pct"].mean() * 100, color="orange",
+                        linestyle="-.", linewidth=1.2, label=f"均值{df['pnl_pct'].mean()*100:+.2f}%")
+    axes[0, 2].legend(fontsize=8)
+    axes[0, 2].set_title("每笔收益分布（%）")
+    axes[0, 2].set_xlabel("收益率（%）")
+
+    # 4. 出场原因饼图
+    reasons = df["exit_reason"].value_counts()
+    label_map = {
+        "stop_loss": "ATR止损", "time_stop": "时间止损",
+        "gap_abort": "低开止损", "ma5_stop": "均线止损",
+        "ma10_stop": "MA10止损", "trail_stop": "跟踪止盈",
+        "t2_trail": "T2追踪", "target1": "一止盈",
+        "target2": "二止盈", "timeout": "超时"
+    }
+    labels = [label_map.get(r, r) for r in reasons.index]
+    colors = []
+    for r in reasons.index:
+        if r in ("trail_stop", "t2_trail", "target1", "target2", "timeout", "ma10_stop"):
+            colors.append("#22C55E")
+        else:
+            colors.append("#EF4444")
+    axes[1, 0].pie(reasons.values, labels=labels, autopct="%1.1f%%", colors=colors)
+    axes[1, 0].set_title("出场原因分布（绿=盈利/超时，红=止损）")
+
+    # 5. ★ v4.0：按年度胜率柱状图
+    yearly = stats.get("yearly_stats", {})
+    if yearly:
+        yrs  = [str(y) for y in yearly.keys()]
+        ywrs = [yearly[y]["win_rate"] for y in yearly.keys()]
+        yret = [yearly[y]["total_ret"] * 100 for y in yearly.keys()]
+        x    = np.arange(len(yrs))
+        w    = 0.35
+        axes[1, 1].bar(x - w/2, ywrs, w, label="胜率", color="#5FA8D3")
+        axes[1, 1].axhline(0.5, color="red", linestyle="--", linewidth=0.8)
+        ax3 = axes[1, 1].twinx()
+        colors_yr = ["#22C55E" if v >= 0 else "#EF4444" for v in yret]
+        ax3.bar(x + w/2, yret, w, label="年度累计(%)", color=colors_yr, alpha=0.7)
+        ax3.axhline(0, color="gray", linestyle=":", linewidth=0.6)
+        axes[1, 1].set_xticks(x); axes[1, 1].set_xticklabels(yrs, rotation=45)
+        axes[1, 1].set_title("按年度统计（验证跨周期稳定性）")
+        axes[1, 1].set_ylim(0, 1)
+        axes[1, 1].legend(loc="upper left"); ax3.legend(loc="upper right")
+
+    # 6. ★ v4.0：按月度胜率热力图
+    monthly = stats.get("monthly_stats", {})
+    if monthly:
+        months = list(range(1, 13))
+        month_wrs = [monthly.get(m, {}).get("win_rate", 0) for m in months]
+        month_pnls = [monthly.get(m, {}).get("avg_pnl", 0) * 100 for m in months]
+        month_names = ["1月","2月","3月","4月","5月","6月","7月","8月","9月","10月","11月","12月"]
+        x = np.arange(12)
+        colors_mo = ["#22C55E" if v >= 0 else "#EF4444" for v in month_pnls]
+        axes[1, 2].bar(x, month_pnls, color=colors_mo, alpha=0.7, label="月均收益(%)")
+        axes[1, 2].axhline(0, color="gray", linestyle=":", linewidth=0.6)
+        ax4 = axes[1, 2].twinx()
+        ax4.plot(x, month_wrs, "o-", color="#5FA8D3", linewidth=1.5, label="月胜率")
+        ax4.axhline(0.5, color="red", linestyle="--", linewidth=0.8, alpha=0.5)
+        ax4.set_ylim(0, 1)
+        axes[1, 2].set_xticks(x); axes[1, 2].set_xticklabels(month_names, rotation=45, fontsize=8)
+        axes[1, 2].set_title("按月度统计（季节性规律）")
+        axes[1, 2].legend(loc="upper left", fontsize=8)
+        ax4.legend(loc="upper right", fontsize=8)
+
+    plt.tight_layout()
+    plt.savefig("daban_result.png", dpi=120, bbox_inches="tight")
+    log.info("图表已保存到 daban_result.png")
+    plt.close("all")
+
+
+# ================================================================
+# 主流程
+# ================================================================
+def main():
+    parser = argparse.ArgumentParser(description="打板策略 · 历史回测")
+    parser.add_argument("--codes",    nargs="+", help="指定股票代码（不加则跑全部股票池）")
+    parser.add_argument("--start",    default="2021-01-01", help="回测开始日期")
+    parser.add_argument("--end",      default=datetime.date.today().strftime("%Y-%m-%d"))
+    parser.add_argument("--strategy", nargs="+", choices=STRATEGIES_ALL,
+                        default=STRATEGIES_ALL, help="要跑的策略，默认全部")
+    parser.add_argument("--max-stocks", type=int, default=0,
+                        help="从股票池随机抽取N只（0=全量，用于快速测试）")
+    parser.add_argument("--workers",  type=int, default=20)
+    parser.add_argument("--plot",     action="store_true", help="画图")
+    parser.add_argument("--csv",      default="daban_trades.csv")
+    parser.add_argument("--factor-analysis", action="store_true",
+                        help="输出量比/连板天数等因子分组胜率分析")
+    parser.add_argument("--sendkey", default="",
+                        help="Server酱 SendKey（也可通过环境变量 SENDKEY 传入）")
+    args = parser.parse_args()
+
+    log.info(f"回测区间：{args.start} ~ {args.end}")
+    log.info(f"回测策略：{args.strategy}")
+
+    # 确定股票列表
+    if args.codes:
+        codes = []
+        for c in args.codes:
+            c = c.zfill(6)
+            codes.append(c + ".SH" if c.startswith("6") else c + ".SZ")
+        log.info(f"指定股票：{codes}")
+    else:
+        codes = fetch_pool_codes()
+        if not codes:
+            log.error("无法获取股票池，请用 --codes 指定")
+            return
+        if args.max_stocks and args.max_stocks < len(codes):
+            import random
+            random.seed(42)
+            codes = random.sample(codes, args.max_stocks)
+            log.info(f"随机抽取 {args.max_stocks} 只股票进行回测")
+
+    # 拉取历史数据
+    # baostock 不支持多线程并发，串行拉取；akshare/yfinance 可并发
+    log.info(f"开始拉取 {len(codes)} 只股票历史数据...")
+    hist_data = {}
+    if USE_BS:
+        # 串行拉取，避免 baostock session 冲突
+        for i, c in enumerate(codes, 1):
+            df = fetch_history(c, args.start, args.end)
+            if df is not None:
+                hist_data[c] = df
+            if i % 50 == 0:
+                log.info(f"  已拉取 {i}/{len(codes)}，有效 {len(hist_data)} 只...")
+    else:
+        with ThreadPoolExecutor(max_workers=args.workers) as exe:
+            futs = {exe.submit(fetch_history, c, args.start, args.end): c for c in codes}
+            for fut in as_completed(futs):
+                c  = futs[fut]
+                df = fut.result()
+                if df is not None:
+                    hist_data[c] = df
+    log.info(f"数据加载完成：{len(hist_data)} 只")
+
+    if not hist_data:
+        log.error("无有效数据，退出")
+        return
+
+    # 逐股回测
+    log.info("开始逐股回测...")
+    all_trades = []
+    with ThreadPoolExecutor(max_workers=min(args.workers, 8)) as exe:
+        futs = {
+            exe.submit(backtest_single, c, df, args.strategy): c
+            for c, df in hist_data.items()
+        }
+        done = 0
+        for fut in as_completed(futs):
+            trades = fut.result()
+            all_trades.extend(trades)
+            done += 1
+            if done % 50 == 0:
+                log.info(f"  回测进度：{done}/{len(hist_data)}，累计 {len(all_trades)} 笔")
+
+    log.info(f"回测完成，共 {len(all_trades)} 笔交易")
+
+    if not all_trades:
+        log.warning("无交易信号，请检查股票数据或放宽参数")
+        return
+
+    stats = calc_stats(all_trades, bt_start=args.start, bt_end=args.end)
+    print_report(stats, all_trades)
+    save_csv(all_trades, args.csv)
+
+    if getattr(args, "factor_analysis", False):
+        factor_analysis_report(all_trades)
+
+    if args.plot:
+        plot_equity(all_trades, stats)
+
+    # ── Server酱推送回测摘要 ──
+    push_serverchan(stats, all_trades,
+                    sendkey=args.sendkey,
+                    bt_start=args.start, bt_end=args.end)
+
+
+if __name__ == "__main__":
+    main()
