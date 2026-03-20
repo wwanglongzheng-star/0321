@@ -4,17 +4,17 @@ on:
   workflow_dispatch:
     inputs:
       start_date:
-        description: "回测开始日期（YYYY-MM-DD，留空用默认值）"
+        description: "回测开始日期（YYYY-MM-DD，留空用默认值 2021-01-01）"
         required: false
         default: ""
       end_date:
-        description: "回测结束日期（YYYY-MM-DD，留空用默认值）"
+        description: "回测结束日期（YYYY-MM-DD，留空=今天）"
         required: false
         default: ""
       max_stocks:
-        description: "最多回测股票数（留空=全量，建议先用200测试）"
+        description: "最多回测股票数（0=全量）"
         required: false
-        default: "200"
+        default: "0"
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -41,6 +41,8 @@ jobs:
           pip install -r requirements.txt
 
       - name: 运行回测
+        env:
+          SENDKEY: ${{ secrets.SENDKEY }}
         run: |
           START="${{ github.event.inputs.start_date }}"
           END="${{ github.event.inputs.end_date }}"
@@ -49,7 +51,7 @@ jobs:
           CMD="python daban_backtest.py --plot --factor-analysis --csv daban_trades.csv"
           [ -n "$START" ] && CMD="$CMD --start $START"
           [ -n "$END"   ] && CMD="$CMD --end $END"
-          [ -n "$MAX" ] && [ "$MAX" != "0" ] && CMD="$CMD --max-stocks $MAX"
+          [ -n "$MAX"   ] && [ "$MAX" != "0" ] && CMD="$CMD --max-stocks $MAX"
 
           echo "执行命令：$CMD"
           eval $CMD
@@ -61,8 +63,7 @@ jobs:
           name: backtest-result-${{ github.run_number }}
           path: |
             daban_trades.csv
-            backtest_*.csv
-            backtest_*.png
+            daban_result.png
             *.log
           if-no-files-found: warn
           retention-days: 30
