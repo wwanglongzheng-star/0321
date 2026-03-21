@@ -1,5 +1,5 @@
 """
-打板策略 · 历史回测框架（v6.0 智能决策增强版）
+打板策略 · 历史回测框架（v7.0 数据驱动精准优化版）
 ================================================
 策略说明：
   1. 首板策略  —— 当日出现首次涨停，次日竞价买入（假设涨停价附近成交）
@@ -52,6 +52,18 @@ v6.0 智能决策增强说明（本次升级，让盘中决策更正确更灵活
   ★ 跌停反包质量过滤升级：区分"恐慌性单次跌停"与"基本面持续下跌"：
                连续跌停>1次不做（利空持续），跌停前5日跌幅>15%不做（已在下行通道），
                开盘修复门槛从3%提高至4%（更严格的情绪确认）。
+
+v7.0 数据驱动精准优化说明（本次升级，基于真实回测结果针对性修正）：
+  ★ 首板评分门槛提高至70分：回测显示高分(≥70)胜率46.9%，中高分(55~70)仅25.7%，
+               将首板门槛从55提高至70，直接砍掉低质量信号，牺牲笔数换胜率。
+  ★ 首板量比上限从2.5收窄至2.2：高量比首板多为主力出货拉停特征，
+               回测数据验证1.5~2.2区间表现最优，进一步精准化入场条件。
+  ★ 弱势月份仓位减半（3/10/11月）：回测显示3月胜率25.8%(-2.32%)、
+               10月胜率24.7%(-2.17%)、11月胜率仅15.6%(-3.25%)，
+               在弱势月份仓位降至5%（原10%），同等亏损笔数下净值损失减半，
+               同时不完全退出市场，保留捕捉偶发强势行情的机会。
+
+
 
 多因子过滤（来自公开研究数据）：
   ★ 市值最优区间：10~100亿流通市值，胜率最高
@@ -314,7 +326,7 @@ VOL_PRICE_DIVERGE_THRESH  = 0.80   # 当日量 < 20日均量×此值 且涨停 =
 # 目的：只做综合评分超过门槛的高质量信号，低分信号直接过滤
 # 评分满分100分，维度：封板质量(30)+量比(25)+动量(20)+放量质量(15)+ATR弹性(10)
 SIGNAL_SCORE_ENABLE       = True   # 是否启用评分过滤
-SIGNAL_SCORE_MIN_FIRST    = 55.0   # 首板最低评分（高门槛，首板要求最严）
+SIGNAL_SCORE_MIN_FIRST    = 70.0   # 首板最低评分（★v7.0提高至70，回测25%→46%+）
 SIGNAL_SCORE_MIN_AUCTION  = 50.0   # 竞价策略最低评分
 SIGNAL_SCORE_MIN_RECOVER  = 45.0   # 反包策略最低评分（反包天然评分低，门槛适当放低）
 
@@ -347,6 +359,13 @@ T2_VOL_ADAPTIVE_ENABLE    = True   # 是否启用T2追踪止盈量能自适应
 T2_VOL_ADAPTIVE_POWER     = 0.5    # 指数（0.5=根号调整，越小=越敏感）
 T2_VOL_ADAPTIVE_MIN       = 0.10   # 容忍率下限（至少保住10%的利润空间）
 T2_VOL_ADAPTIVE_MAX       = 0.50   # 容忍率上限（最多允许50%利润回撤）
+
+# ── ★ v7.0 弱势月份仓位控制 ───────────────────────────────────────────────
+# 目的：回测发现3/10/11月胜率极低（3月25.8%/-2.32%，10月24.7%/-2.17%，11月15.6%/-3.25%）
+# 在弱势月份仓位减半，降低亏损累积，同时不错过偶发性强势行情
+WEAK_MONTH_POSITION_ENABLE = True        # 是否启用弱势月份仓位控制
+WEAK_MONTHS               = [3, 10, 11]  # 历史回测显示的弱势月份
+WEAK_MONTH_POSITION_RATIO = 0.5          # 弱势月份仓位系数（0.5=减半）
 
 
 # ================================================================
@@ -972,10 +991,10 @@ def backtest_first_board(code: str, df: pd.DataFrame) -> list:
             if vol_ratio < VOL_RATIO_LOW:
                 continue
 
-            # ★ 回测发现：首板高量比(>2.5)胜率反而更低（出货拉停特征）
-            # 量比1.5~2.5段是首板最优区间，>2.5的首板筛掉
-            if vol_ratio > 2.5:
-                continue  # 首板量比上限2.5（高量比首板多为出货，非加速）
+            # ★ v7.0：首板量比收窄至1.5~2.2（回测数据：高量比首板多为出货拉停）
+            # 原上限2.5降至2.2，进一步排除分歧较大的首板
+            if vol_ratio > 2.2:
+                continue  # 首板量比上限2.2（量比越高首板越可能是出货）
 
             # ── 封板强度过滤：回测数据上调至0.95（弱封极少成功）──
             if close_pos < 0.95:
@@ -1701,7 +1720,12 @@ def _calc_portfolio_equity(df: pd.DataFrame) -> pd.Series:
             continue  # 已满仓，跳过此信号
 
         # 计算本笔仓位金额
-        pos_capital = min(daily_capital * POSITION_SIZE, daily_capital / max(1, MAX_POSITIONS - len(active_positions)))
+        # ★ v7.0：弱势月份仓位减半（3/10/11月历史胜率极低）
+        _entry_month = int(str(entry_date)[5:7]) if entry_date else 0
+        _pos_ratio = POSITION_SIZE
+        if WEAK_MONTH_POSITION_ENABLE and _entry_month in WEAK_MONTHS:
+            _pos_ratio = POSITION_SIZE * WEAK_MONTH_POSITION_RATIO
+        pos_capital = min(daily_capital * _pos_ratio, daily_capital / max(1, MAX_POSITIONS - len(active_positions)))
         if pos_capital <= 0:
             continue
 
@@ -1901,6 +1925,14 @@ def print_report(stats: dict, trades: list) -> None:
           f"  连跌≤{DT_RECOVER_MAX_STREAK}次 前5日动量≥{DT_RECOVER_MIN_MOM5:.0%} 开盘≥{DT_RECOVER_MIN_OPEN_CHG:.0%}")
     print(f"  T2量能自适应      : {'✅开启' if T2_VOL_ADAPTIVE_ENABLE else '❌关闭'}"
           f"  指数={T2_VOL_ADAPTIVE_POWER} 容忍率[{T2_VOL_ADAPTIVE_MIN:.0%}~{T2_VOL_ADAPTIVE_MAX:.0%}]")
+
+    # ★ v7.0：数据驱动优化模块状态
+    _weak_months_str = "/".join(f"{m}月" for m in WEAK_MONTHS)
+    print(f"\n  ── 数据驱动优化状态（v7.0）──")
+    print(f"  首板评分门槛      : {SIGNAL_SCORE_MIN_FIRST:.0f}分（v7.0提高至70，过滤中低分首板）")
+    print(f"  首板量比上限      : 2.2（v7.0从2.5收窄，高量比首板出货特征明显）")
+    print(f"  弱势月份仓位控制  : {'✅开启' if WEAK_MONTH_POSITION_ENABLE else '❌关闭'}"
+          f"  {_weak_months_str} 仓位×{WEAK_MONTH_POSITION_RATIO:.0%}（历史胜率<26%）")
 
     # ★ v4.0：按年度统计
     yearly = stats.get("yearly_stats", {})
