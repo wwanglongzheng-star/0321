@@ -1,5 +1,5 @@
 """
-打板策略 · 历史回测框架（v4.0 全面优化版）
+打板策略 · 历史回测框架（v6.0 智能决策增强版）
 ================================================
 策略说明：
   1. 首板策略  —— 当日出现首次涨停，次日竞价买入（假设涨停价附近成交）
@@ -17,6 +17,41 @@ v4.0 优化说明：
   ★ 止损优先级：理清ATR止损/时间止损优先级，同日触发取更优出场价
   ★ 股票池扩大：改为中证1000+创业板指+科创50（移除大市值沪深300）
   ★ 分析维度：增加按年度/月度统计、连续亏损分析、行业分布统计
+
+v5.0 反收割增强说明（核心升级，防止被高频/做市商策略猎杀）：
+  ★ 止损位随机化：每笔交易止损线在基准值基础上叠加随机扰动（±STOP_JITTER_RANGE），
+               避免全市场所有策略使用者的止损堆积在同一价格，被主力精准触发后拉回。
+  ★ 止盈点反整数化：T1/T2止盈触发点偏离整数位（±PROFIT_JITTER_RANGE），
+               规避做市商在整数关口（+10%/+20%）密集挂卖单的陷阱。
+  ★ 入场保护-竞价虚假挂单检测：通过检测竞价区间内历史"拉高撤单"特征（近N日
+               高开但当日大幅回落的比率），过滤竞价钓鱼盘信号，
+               默认启用（FILTER_FAKE_AUCTION=True，阈值FAKE_AUCTION_THRESH=0.40）。
+  ★ 信号执行随机延迟（可选）：对同等质量的信号引入±1日的随机执行延迟，
+               降低策略行为的可预测性，规避被跟单/反向跟踪。
+               默认关闭（SIGNAL_DELAY_RANDOM=False），实盘使用时按需开启。
+  ★ 炸板后再封陷阱检测：检测近N日内涨停后开板再封的次数，该形态是主力
+               反复吸引追板资金后砸盘的典型手法，超过阈值直接跳过。
+               （FILTER_RECLOSE_TRAP=True，RECLOSE_TRAP_MAX=2）
+
+v6.0 智能决策增强说明（本次升级，让盘中决策更正确更灵活胜率更高）：
+  ★ 量价背离过滤：新增涨停日量价背离字段（vol_price_diverge），
+               真正的主力拉升必须放量，涨停日成交量低于20日均量80%为假突破，
+               默认过滤（FILTER_VOL_PRICE_DIVERGE=True）。
+  ★ 情绪综合评分系统（0~100分）：将封板质量(30分)+量比(25分)+近5日动量(20分)
+               +放量质量(15分)+ATR弹性(10分)合成signal_score字段，
+               只做达到评分门槛的高质量信号（首板≥55，竞价≥50，反包≥45），
+               因子分析报告中会自动验证评分系统有效性。
+  ★ 动态持仓天数：根据signal_score自动调整持仓上限：
+               高分(≥70)信号延长至10天（让强势利润奔跑），
+               低分(≤45)信号缩短至4天（弱信号快进快出减少损耗），
+               中间区间保持默认7天。
+  ★ T2追踪止盈量能自适应：T2之后，根据当日成交量相对5日均量的比值，
+               动态调整回撤容忍率（量萎缩→收紧容忍→更快锁利润），
+               公式：容忍率 = T2_TRAIL_TOLERANCE × (量比^0.5)，
+               区间限制在[10%~50%]，避免过于激进或保守。
+  ★ 跌停反包质量过滤升级：区分"恐慌性单次跌停"与"基本面持续下跌"：
+               连续跌停>1次不做（利空持续），跌停前5日跌幅>15%不做（已在下行通道），
+               开盘修复门槛从3%提高至4%（更严格的情绪确认）。
 
 多因子过滤（来自公开研究数据）：
   ★ 市值最优区间：10~100亿流通市值，胜率最高
@@ -59,6 +94,7 @@ import csv
 import datetime
 import warnings
 import logging
+import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Optional
@@ -223,6 +259,95 @@ TRAIL_UPPER_SHADOW_THRESH = 0.40
 # 次日低开过多不追：入场当天开盘相对昨收（涨停价）跌幅超此值，说明情绪转弱
 ENTRY_MAX_GAP_DOWN   = -0.03  # 次日低于涨停价3%以上不入场（情绪不延续）
 
+# ================================================================
+# ★ v5.0 反收割参数（核心新增）
+# ================================================================
+
+# ── 止损位随机化 ───────────────────────────────────────────────────────────
+# 目的：避免全市场同参数策略的止损聚集在同一价格，被主力精准触发后拉回
+# 每笔交易止损线 = 基准止损 + uniform(-STOP_JITTER_RANGE, +STOP_JITTER_RANGE)
+# 例：基准-4.5%，扰动±0.8% → 实际止损在-3.7%~-5.3%随机分布
+STOP_JITTER_ENABLE   = True    # 是否启用止损随机化
+STOP_JITTER_RANGE    = 0.008   # 止损随机扰动幅度（±0.8%）
+
+# ── 止盈点反整数化 ──────────────────────────────────────────────────────────
+# 目的：偏离整数止盈关口（+10%/+20%），避开做市商在整数位密集挂单
+# T1/T2实际触发点 = 基准值 + uniform(-PROFIT_JITTER_RANGE, +PROFIT_JITTER_RANGE)
+# 例：T1基准+10%，扰动±0.7% → 实际触发在+9.3%~+10.7%随机
+PROFIT_JITTER_ENABLE = True    # 是否启用止盈点随机化
+PROFIT_JITTER_RANGE  = 0.007   # 止盈随机扰动幅度（±0.7%）
+
+# ── 竞价虚假挂单检测（反钓鱼盘）──────────────────────────────────────────
+# 目的：检测"竞价高开但当日大幅回落"的历史模式，识别竞价钓鱼盘并过滤
+# 判据：近FAKE_AUCTION_LOOKBACK日内，涨停信号股的"竞价高开但当日收盘跌回开盘价以下"比率
+#       超过FAKE_AUCTION_THRESH则认定该股竞价区间存在系统性操控，过滤竞价策略信号
+FILTER_FAKE_AUCTION       = True   # 是否开启竞价虚假挂单检测
+FAKE_AUCTION_LOOKBACK     = 20     # 检测近N日历史
+FAKE_AUCTION_THRESH       = 0.40   # 近N日"高开回落"比率超此值则过滤（40%）
+
+# ── 炸板后再封陷阱检测 ────────────────────────────────────────────────────
+# 目的：过滤"涨停→炸板→再次封板"这类反复诱多后砸盘的主力手法
+# 判据：近RECLOSE_TRAP_DAYS日内，该股出现"炸板当日最终收盘反弹≥2%"（再封特征）次数
+#       超过RECLOSE_TRAP_MAX则过滤，说明主力惯用此手法收割
+FILTER_RECLOSE_TRAP       = True   # 是否开启再封陷阱检测
+RECLOSE_TRAP_DAYS         = 30     # 检测近N日
+RECLOSE_TRAP_MAX          = 2      # 近N日再封陷阱次数超出则过滤
+
+# ── 信号执行随机延迟（可选，降低行为可预测性）────────────────────────────
+# 目的：对同等质量信号引入±1日随机延迟，规避被跟单/反向跟踪
+# 注意：开启后会显著影响回测结果（部分信号延迟后次日情绪已变化），
+#       建议仅在实盘执行层使用，回测默认关闭
+SIGNAL_DELAY_RANDOM       = False  # 默认关闭（实盘按需开启）
+SIGNAL_DELAY_SEED         = None   # 随机种子（None=每次不同，整数=可复现）
+
+
+# ================================================================
+# ★ v6.0 智能化参数（核心升级）
+# ================================================================
+
+# ── 量价背离过滤 ──────────────────────────────────────────────────────────
+# 目的：过滤"价格涨停但成交量异常低"的假突破信号，真正的主力拉升必须放量
+FILTER_VOL_PRICE_DIVERGE  = True   # 是否开启量价背离过滤（True=过滤缩量涨停）
+VOL_PRICE_DIVERGE_THRESH  = 0.80   # 当日量 < 20日均量×此值 且涨停 = 量价背离
+
+# ── 情绪综合评分门槛 ──────────────────────────────────────────────────────
+# 目的：只做综合评分超过门槛的高质量信号，低分信号直接过滤
+# 评分满分100分，维度：封板质量(30)+量比(25)+动量(20)+放量质量(15)+ATR弹性(10)
+SIGNAL_SCORE_ENABLE       = True   # 是否启用评分过滤
+SIGNAL_SCORE_MIN_FIRST    = 55.0   # 首板最低评分（高门槛，首板要求最严）
+SIGNAL_SCORE_MIN_AUCTION  = 50.0   # 竞价策略最低评分
+SIGNAL_SCORE_MIN_RECOVER  = 45.0   # 反包策略最低评分（反包天然评分低，门槛适当放低）
+
+# ── 动态持仓天数 ──────────────────────────────────────────────────────────
+# 目的：强势信号（高分）延长持仓天数让利润奔跑；弱势信号提前出场减少损耗
+# 规则：signal_score >= DYNAMIC_HOLD_HIGH_THRESH → 持仓延长至 HOLD_DAYS_STRONG
+#        signal_score <= DYNAMIC_HOLD_LOW_THRESH  → 持仓缩短至 HOLD_DAYS_WEAK
+#        中间区间保持默认 HOLD_DAYS
+DYNAMIC_HOLD_ENABLE       = True   # 是否启用动态持仓天数
+DYNAMIC_HOLD_HIGH_THRESH  = 70.0   # 评分≥70分 = 强势，延长持仓
+DYNAMIC_HOLD_LOW_THRESH   = 45.0   # 评分≤45分 = 弱势，缩短持仓
+HOLD_DAYS_STRONG          = 10     # 强势信号最大持仓天数（原7天延长至10天）
+HOLD_DAYS_WEAK            = 4      # 弱势信号最大持仓天数（缩短至4天快进快出）
+
+# ── 跌停反包质量过滤 ──────────────────────────────────────────────────────
+# 目的：只做"恐慌性单次跌停后快速修复"，拒绝连续下跌/利空下跌的假反包
+# 判据：连续跌停天数 > DT_RECOVER_MAX_STREAK 不做（基本面持续利空）
+#        跌停前5日动量 < DT_RECOVER_MIN_MOM5 不做（已在下跌通道，非短期恐慌）
+DT_RECOVER_QUALITY_FILTER = True   # 是否启用反包质量过滤
+DT_RECOVER_MAX_STREAK     = 1      # 最多允许连续跌停天数（>1天连跌不做）
+DT_RECOVER_MIN_MOM5       = -0.15  # 跌停前5日动量下限（5日内跌幅超15%不做）
+DT_RECOVER_MIN_OPEN_CHG   = 0.04   # 反包当日开盘涨幅下限（从3%提高到4%，确保情绪真实修复）
+
+# ── T2追踪止盈自适应出场 ──────────────────────────────────────────────────
+# 目的：T2之后，根据当日成交量萎缩程度动态调整回撤容忍率
+# 成交量萎缩越严重，说明多头动能衰竭，应收紧容忍率更快锁住利润
+# 动态容忍率 = T2_TRAIL_TOLERANCE × (当日量/5日均量)^T2_VOL_ADAPTIVE_POWER
+# 例：成交量只有均量的30%时，容忍率 = 0.30×(0.3)^0.5 ≈ 0.164（大幅收紧）
+T2_VOL_ADAPTIVE_ENABLE    = True   # 是否启用T2追踪止盈量能自适应
+T2_VOL_ADAPTIVE_POWER     = 0.5    # 指数（0.5=根号调整，越小=越敏感）
+T2_VOL_ADAPTIVE_MIN       = 0.10   # 容忍率下限（至少保住10%的利润空间）
+T2_VOL_ADAPTIVE_MAX       = 0.50   # 容忍率上限（最多允许50%利润回撤）
+
 
 # ================================================================
 # 交易记录
@@ -250,6 +375,9 @@ class Trade:
     is_yizi:      bool   = False  # 信号当日是否为一字板（开盘即封死，实盘买不进去）
     avg_amplitude: float = 0.0   # 近20日日均振幅%（衡量弹性）
     avg_amount_m:  float = 0.0   # 近20日日均成交额（百万元）
+    # ★ v6.0 智能化字段
+    signal_score:  float = 0.0   # 情绪综合评分（0~100分），越高信号质量越好
+    dynamic_hold:  int   = 0     # 实际使用的动态持仓天数上限
 
 
 # ================================================================
@@ -407,6 +535,101 @@ def fetch_history(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
         df["atr_stop_pct"] = -(df["atr14"] / df["收盘"].replace(0, np.nan)) * 1.5
         df["atr_stop_pct"] = df["atr_stop_pct"].clip(lower=-0.08, upper=-0.02)  # 限制在-2%~-8%
 
+        # ── ★ v5.0 反收割字段①：竞价虚假挂单特征 ─────────────────
+        # "竞价高开但当日最终收盘低于开盘价"为钓鱼盘特征
+        # fake_open_day：今日高开(>2%)但收盘<开盘（高开低走=竞价诱多后砸盘）
+        df["fake_open_day"] = (df["chg_pct"] >= 0.02) & (df["收盘"] < df["开盘"])
+        # 近FAKE_AUCTION_LOOKBACK日内高开低走次数
+        df["fake_open_cnt"] = (
+            df["fake_open_day"]
+            .rolling(FAKE_AUCTION_LOOKBACK, min_periods=1)
+            .sum()
+            .shift(1)
+            .fillna(0)
+        )
+        # 近N日内高开次数（用于算比率分母）
+        df["high_open_cnt"] = (
+            (df["chg_pct"] >= 0.02)
+            .rolling(FAKE_AUCTION_LOOKBACK, min_periods=1)
+            .sum()
+            .shift(1)
+            .fillna(0)
+        )
+        # 虚假高开比率（假信号比例），分母为0时置0
+        df["fake_auction_ratio"] = (
+            df["fake_open_cnt"] / df["high_open_cnt"].replace(0, np.nan)
+        ).fillna(0.0)
+
+        # ── ★ v5.0 反收割字段②：炸板后再封陷阱 ──────────────────
+        # "当日炸板但最终收盘仍高于开盘价2%以上"为再封陷阱特征（反复诱多）
+        df["reclose_trap_day"] = (
+            df["is_bomb"] &                               # 当日炸板
+            ((df["收盘"] - df["开盘"]) / df["开盘"].replace(0, np.nan) >= 0.02)  # 收盘仍强
+        )
+        # 近RECLOSE_TRAP_DAYS日内再封陷阱出现次数
+        df["reclose_trap_cnt"] = (
+            df["reclose_trap_day"]
+            .rolling(RECLOSE_TRAP_DAYS, min_periods=1)
+            .sum()
+            .shift(1)
+            .fillna(0)
+            .astype(int)
+        )
+
+        # ── ★ v6.0 智能化字段①：量价背离检测 ────────────────────
+        # 原理：真正的主力拉升涨停，必须放量（量价同步）；若缩量涨停则是假突破
+        # vol_vs_ma20：当日成交量相对近20日均量的比值（>1放量，<1缩量）
+        vol_ma20 = df["成交量"].rolling(20, min_periods=5).mean().shift(1)
+        df["vol_vs_ma20"] = (df["成交量"] / vol_ma20.replace(0, np.nan)).fillna(1.0)
+        # 量价背离标志：涨停日成交量却低于20日均量×0.8，高度疑似假突破
+        df["vol_price_diverge"] = df["is_zt"] & (df["vol_vs_ma20"] < 0.80)
+        # 近5日量能趋势（成交量加速/衰退）：正值=放量加速，负值=缩量衰退
+        df["vol_trend_5d"] = (
+            df["成交量"].rolling(3, min_periods=2).mean() /
+            df["成交量"].rolling(3, min_periods=2).mean().shift(3).replace(0, np.nan)
+        ).fillna(1.0)
+
+        # ── ★ v6.0 智能化字段②：情绪综合评分（0~100分）──────────
+        # 各因子得分加权求和，得分越高信号质量越好
+        # 因子1：封板质量（close_pos，满分30分）
+        score_seal    = (df["close_pos"].clip(0, 1) * 30).fillna(15.0)
+        # 因子2：量比分档（量比1.5~3.0最优，满分25分）
+        # 过低=无力，过高=出货，最优区间线性映射到满分
+        vr_score = np.where(
+            df["vol_ratio"] < 1.5, df["vol_ratio"] / 1.5 * 15,
+            np.where(
+                df["vol_ratio"] <= 3.0,
+                15 + (df["vol_ratio"] - 1.5) / 1.5 * 10,
+                np.where(df["vol_ratio"] <= 5.0, 25 - (df["vol_ratio"] - 3.0) / 2.0 * 10, 5)
+            )
+        )
+        score_volratio = pd.Series(vr_score, index=df.index).fillna(10.0)
+        # 因子3：近5日动量（正动量+高分，负动量-分，满分20分）
+        score_mom = ((df["mom_5d"].clip(-0.15, 0.15) / 0.15 + 1) * 10).fillna(10.0)
+        # 因子4：放量质量（vol_vs_ma20，满分15分，缩量大幅扣分）
+        score_vol = (df["vol_vs_ma20"].clip(0, 3) / 3 * 15).fillna(7.5)
+        # 因子5：ATR波动奖励（适度波动最优，太小无弹性，太大风险高，满分10分）
+        atr_pct   = (-df["atr_stop_pct"]).clip(0.02, 0.08)  # 转正值
+        score_atr = ((atr_pct - 0.02) / 0.06 * 10).fillna(5.0)
+        # 汇总评分
+        df["signal_score"] = (
+            score_seal + score_volratio + score_mom + score_vol + score_atr
+        ).clip(0, 100)
+
+        # ── ★ v6.0 智能化字段③：跌停质量字段（用于反包策略）──────
+        # 连续跌停次数（反包需要区分：恐慌性单次跌停 vs 基本面持续下跌）
+        dt_streak_list = []
+        dt_s = 0
+        for v in df["is_dt"]:
+            if v:
+                dt_s += 1
+            else:
+                dt_s = 0
+            dt_streak_list.append(dt_s)
+        df["dt_streak"] = dt_streak_list
+        # 跌停前5日的动量（跌停前5日如果已经大跌>15%，说明是基本面利空，不做反包）
+        df["mom_5d_before_dt"] = df["mom_5d"].shift(1)
+
         return df
     except Exception as e:
         log.debug(f"{code} 数据失败: {e}")
@@ -542,35 +765,57 @@ def _trail_stop_price(entry_price: float, peak_price: float,
 
 
 def simulate_exit(df: pd.DataFrame, entry_idx: int, entry_price: float,
-                  atr_stop_pct: Optional[float] = None) -> tuple:
+                  atr_stop_pct: Optional[float] = None,
+                  rng: Optional[random.Random] = None,
+                  hold_days_limit: Optional[int] = None) -> tuple:
     """
-    出场逻辑（v4.0 修复版，含智能跟踪止盈 + ATR动态止损 + T2后追踪止盈）：
+    出场逻辑（v6.0 智能自适应版）：
       1. 入场第1天低开保护：开盘低开>3% 直接止损
-      2. ★ v4.0 止损优先级修复：
-           同日 ATR止损 和 时间止损 同时触发时，取更优（亏损更小）的出场价
-           ATR动态止损（T1前有效）：止损 = 入场价 × (1 + atr_stop_pct)
-           时间止损（持仓>2天未盈利）：收紧至-3%
-      3. ★ v4.0 趋势止损改为MA10，持仓≥5天生效（减少早期噪音止损）
-      4. ★ 优化⑤ T2后追踪止盈：
-           触达 +20% 后不立即出场，改为跟踪最高点×(1-T2_TRAIL_TOLERANCE)
-      5. 智能跟踪止盈（T1+10%后启动）
-      6. 超时平仓（HOLD_DAYS=7天）
+      2. ★ v4.0 止损优先级修复：同日ATR止损/时间止损取更优出场价
+      3. ★ v4.0 趋势止损：MA10，持仓≥5天生效
+      4. ★ 优化⑤ T2后追踪止盈
+      5. 智能跟踪止盈（T1后启动）
+      6. 超时平仓
+      ★ v5.0：止损位随机化 + 止盈点反整数化
+      ★ v6.0：动态持仓天数 + T2追踪止盈量能自适应
     """
+    _rng = rng if rng is not None else random
+    # ★ v6.0：动态持仓天数（外部传入优先，否则用默认值）
+    _hold_days = hold_days_limit if hold_days_limit is not None else HOLD_DAYS
+
     # ★ ATR动态止损（若有ATR数据则用，否则回退固定止损）
     if atr_stop_pct is not None and atr_stop_pct < 0:
         dynamic_stop_pct = atr_stop_pct   # 已限制在 -2%~-8%
     else:
         dynamic_stop_pct = STOP_LOSS      # 回退至固定止损 -4.5%
 
-    stop_price = entry_price * (1 + dynamic_stop_pct)   # 动态初始止损
-    t1_price   = entry_price * (1 + PROFIT_T1)   # +10%
-    t2_price   = entry_price * (1 + PROFIT_T2)   # +20%
+    # ★ v5.0 止损位随机化：在基准止损基础上叠加均匀随机扰动
+    # 每笔交易止损位独立随机，避免全市场同参数止损堆积在同一价格
+    if STOP_JITTER_ENABLE:
+        jitter = _rng.uniform(-STOP_JITTER_RANGE, STOP_JITTER_RANGE)
+        dynamic_stop_pct = dynamic_stop_pct + jitter
+        # 防止止损过松（>-1%）或过紧（<-12%）
+        dynamic_stop_pct = max(-0.12, min(-0.01, dynamic_stop_pct))
+
+    # ★ v5.0 止盈点反整数化：偏离整数关口，规避做市商密集挂单陷阱
+    if PROFIT_JITTER_ENABLE:
+        t1_jitter = _rng.uniform(-PROFIT_JITTER_RANGE, PROFIT_JITTER_RANGE)
+        t2_jitter = _rng.uniform(-PROFIT_JITTER_RANGE, PROFIT_JITTER_RANGE)
+        effective_t1 = PROFIT_T1 + t1_jitter   # 例：9.3%~10.7%
+        effective_t2 = PROFIT_T2 + t2_jitter   # 例：19.3%~20.7%
+    else:
+        effective_t1 = PROFIT_T1
+        effective_t2 = PROFIT_T2
+
+    stop_price = entry_price * (1 + dynamic_stop_pct)   # 动态初始止损（含随机化）
+    t1_price   = entry_price * (1 + effective_t1)        # 反整数化T1止盈
+    t2_price   = entry_price * (1 + effective_t2)        # 反整数化T2止盈
     n          = len(df)
     t1_hit     = False         # 是否已触达T1（跟踪止盈激活标志）
     t2_hit     = False         # 是否已触达T2（追踪止盈激活标志）
     peak_price = entry_price   # 持仓期间历史最高价（跟踪止盈基准）
 
-    for j in range(entry_idx, min(entry_idx + HOLD_DAYS, n)):
+    for j in range(entry_idx, min(entry_idx + _hold_days, n)):
         row   = df.iloc[j]
         hi    = float(row["最高"])
         lo    = float(row["最低"])
@@ -618,9 +863,18 @@ def simulate_exit(df: pd.DataFrame, entry_idx: int, entry_price: float,
                 t2_hit = True   # 触达T2，激活追踪止盈，不立刻出场
                 t1_hit = True   # 同时激活T1跟踪
             if t2_hit:
-                # 从最高点回撤超过 T2_TRAIL_TOLERANCE 比例的已实现利润则出
+                # ★ v6.0 量能自适应：成交量萎缩时收紧容忍率，成交量放大时放宽
+                if T2_VOL_ADAPTIVE_ENABLE and vol_ma5 > 0:
+                    cur_vol = float(row.get("成交量", 0) or 0)
+                    vol_ratio_now = cur_vol / vol_ma5 if vol_ma5 > 0 else 1.0
+                    # 容忍率随量比的平方根变化（量比越低→容忍率越低→更快锁利）
+                    adaptive_tol = T2_TRAIL_TOLERANCE * (vol_ratio_now ** T2_VOL_ADAPTIVE_POWER)
+                    adaptive_tol = max(T2_VOL_ADAPTIVE_MIN, min(T2_VOL_ADAPTIVE_MAX, adaptive_tol))
+                else:
+                    adaptive_tol = T2_TRAIL_TOLERANCE
+                # 从最高点回撤超过自适应容忍率比例的已实现利润则出
                 profit_from_entry = peak_price - entry_price
-                t2_trail_stop = peak_price - profit_from_entry * T2_TRAIL_TOLERANCE
+                t2_trail_stop = peak_price - profit_from_entry * adaptive_tol
                 if cls <= t2_trail_stop:
                     exit_p = round(cls * (1 - SLIP - COMMISSION), 4)
                     return date, exit_p, "t2_trail", days
@@ -650,13 +904,13 @@ def simulate_exit(df: pd.DataFrame, entry_idx: int, entry_price: float,
                 return date, exit_p, "ma10_stop", days
 
         # ── 6. 超时平仓 ───────────────────────────────────────────
-        if days >= HOLD_DAYS:
+        if days >= _hold_days:
             exit_p = round(cls * (1 - SLIP - COMMISSION), 4)
             return date, exit_p, "timeout", days
 
     # 数据不足，用最后一天收盘平仓
-    last = df.iloc[min(entry_idx + HOLD_DAYS - 1, n - 1)]
-    return str(last["date"])[:10], round(float(last["收盘"]) * (1 - SLIP - COMMISSION), 4), "timeout", HOLD_DAYS
+    last = df.iloc[min(entry_idx + _hold_days - 1, n - 1)]
+    return str(last["date"])[:10], round(float(last["收盘"]) * (1 - SLIP - COMMISSION), 4), "timeout", _hold_days
 
 
 # ================================================================
@@ -741,6 +995,24 @@ def backtest_first_board(code: str, df: pd.DataFrame) -> list:
             if avg_amp > 0 and (avg_amp < 1.5 or avg_amp > 6.0):
                 continue  # 振幅上限从4%放开至6%（超活跃段胜率66.7%/+11.7%）
 
+            # ── ★ v5.0 炸板后再封陷阱检测 ──────────────────────────
+            # 近N日内反复出现"炸板后当日强势收盘"特征，说明主力惯用此手法诱多
+            if FILTER_RECLOSE_TRAP:
+                reclose_cnt = int(row.get("reclose_trap_cnt", 0) or 0)
+                if reclose_cnt > RECLOSE_TRAP_MAX:
+                    continue
+
+            # ── ★ v6.0 量价背离过滤 ──────────────────────────────
+            # 涨停日缩量（量<20日均量×0.8）是假突破信号，直接过滤
+            if FILTER_VOL_PRICE_DIVERGE:
+                if bool(row.get("vol_price_diverge", False)):
+                    continue
+
+            # ── ★ v6.0 情绪综合评分过滤（只做高质量信号）──────────
+            score = float(row.get("signal_score", 50.0) or 50.0)
+            if SIGNAL_SCORE_ENABLE and score < SIGNAL_SCORE_MIN_FIRST:
+                continue  # 评分不达标，信号质量不够，跳过
+
         if i + 1 >= n:
             break
         nxt = df.iloc[i + 1]
@@ -755,13 +1027,30 @@ def backtest_first_board(code: str, df: pd.DataFrame) -> list:
             if gap < ENTRY_MAX_GAP_DOWN:
                 continue  # 次日相对涨停价低开过多，情绪不延续
 
+        # ── ★ v5.0 信号执行随机延迟（降低行为可预测性）────────────
+        if SIGNAL_DELAY_RANDOM:
+            _delay_seed = SIGNAL_DELAY_SEED if SIGNAL_DELAY_SEED is not None else None
+            _local_rng = random.Random(_delay_seed)
+            if _local_rng.random() < 0.30:
+                continue
+
+        # ── ★ v6.0 动态持仓天数：按信号评分自动调整 ─────────────
+        score = float(row.get("signal_score", 50.0) or 50.0)
+        if DYNAMIC_HOLD_ENABLE:
+            if score >= DYNAMIC_HOLD_HIGH_THRESH:
+                _dyn_hold = HOLD_DAYS_STRONG   # 强势信号延长持仓
+            elif score <= DYNAMIC_HOLD_LOW_THRESH:
+                _dyn_hold = HOLD_DAYS_WEAK     # 弱势信号缩短持仓
+            else:
+                _dyn_hold = HOLD_DAYS          # 中间段保持默认
+        else:
+            _dyn_hold = HOLD_DAYS
+
         entry_p    = nxt_open * (1 + SLIP + COMMISSION)
         entry_date = str(nxt["date"])[:10]
-        # ★ 优化⑧：传入 ATR 动态止损幅度（当日的 atr_stop_pct）
-        # ★ v4.0修复：simulate_exit 起点从 i+2 修正为 i+1（入场次日=i+1的后一天）
-        # 入场日是 i+1，次日开始持仓检查从 i+1 当天开始（检查低开保护）
         atr_stop = float(row.get("atr_stop_pct", STOP_LOSS) or STOP_LOSS)
-        exit_date, exit_p, reason, hdays = simulate_exit(df, i + 1, entry_p, atr_stop)
+        _trade_rng = random.Random()
+        exit_date, exit_p, reason, hdays = simulate_exit(df, i + 1, entry_p, atr_stop, _trade_rng, _dyn_hold)
         pnl = (exit_p - entry_p) / entry_p
 
         trades.append(Trade(
@@ -776,6 +1065,8 @@ def backtest_first_board(code: str, df: pd.DataFrame) -> list:
             is_yizi=is_yizi,
             avg_amplitude=round(avg_amp, 2),
             avg_amount_m=round(avg_amt_m, 1),
+            signal_score=round(score, 1),
+            dynamic_hold=_dyn_hold,
         ))
 
     return trades
@@ -848,6 +1139,23 @@ def backtest_connect_board(code: str, df: pd.DataFrame,
             if avg_amp > 0 and avg_amp < 1.5:
                 continue
 
+            # ── ★ v5.0 炸板后再封陷阱检测 ──────────────────────────
+            if FILTER_RECLOSE_TRAP:
+                reclose_cnt = int(df.iloc[i].get("reclose_trap_cnt", 0) or 0)
+                if reclose_cnt > RECLOSE_TRAP_MAX:
+                    continue
+
+            # ── ★ v6.0 量价背离过滤 ──────────────────────────────
+            if FILTER_VOL_PRICE_DIVERGE:
+                if bool(df.iloc[i].get("vol_price_diverge", False)):
+                    continue
+
+            # ── ★ v6.0 情绪综合评分过滤 ─────────────────────────
+            # 连板策略门槛与首板一致（连板本身已是高动量，不额外抬高门槛）
+            score_c = float(df.iloc[i].get("signal_score", 50.0) or 50.0)
+            if SIGNAL_SCORE_ENABLE and score_c < SIGNAL_SCORE_MIN_FIRST:
+                continue
+
         if i + 1 >= n:
             break
         nxt = df.iloc[i + 1]
@@ -862,11 +1170,29 @@ def backtest_connect_board(code: str, df: pd.DataFrame,
             if gap < ENTRY_MAX_GAP_DOWN:
                 continue
 
+        # ★ v5.0 信号执行随机延迟
+        if SIGNAL_DELAY_RANDOM:
+            _local_rng = random.Random(SIGNAL_DELAY_SEED)
+            if _local_rng.random() < 0.30:
+                continue
+
+        # ★ v6.0 动态持仓天数
+        score_c = float(df.iloc[i].get("signal_score", 50.0) or 50.0)
+        if DYNAMIC_HOLD_ENABLE:
+            if score_c >= DYNAMIC_HOLD_HIGH_THRESH:
+                _dyn_hold = HOLD_DAYS_STRONG
+            elif score_c <= DYNAMIC_HOLD_LOW_THRESH:
+                _dyn_hold = HOLD_DAYS_WEAK
+            else:
+                _dyn_hold = HOLD_DAYS
+        else:
+            _dyn_hold = HOLD_DAYS
+
         entry_p    = nxt_open * (1 + SLIP + COMMISSION)
         entry_date = str(nxt["date"])[:10]
-        # ★ 优化⑧：传入 ATR 动态止损幅度
         atr_stop = float(df.iloc[i].get("atr_stop_pct", STOP_LOSS) or STOP_LOSS)
-        exit_date, exit_p, reason, hdays = simulate_exit(df, i + 2, entry_p, atr_stop)
+        _trade_rng = random.Random()
+        exit_date, exit_p, reason, hdays = simulate_exit(df, i + 2, entry_p, atr_stop, _trade_rng, _dyn_hold)
         pnl = (exit_p - entry_p) / entry_p
 
         trades.append(Trade(
@@ -881,6 +1207,8 @@ def backtest_connect_board(code: str, df: pd.DataFrame,
             is_yizi=is_yizi,
             avg_amplitude=round(avg_amp, 2),
             avg_amount_m=round(avg_amt_m, 1),
+            signal_score=round(score_c, 1),
+            dynamic_hold=_dyn_hold,
         ))
 
     return trades
@@ -1002,11 +1330,46 @@ def backtest_auction_board(code: str, df: pd.DataFrame) -> list:
                     if vol_ratio < 2.0:
                         continue
 
+            # ── ★ v5.0 竞价虚假挂单检测（反钓鱼盘）──────────────────
+            if FILTER_FAKE_AUCTION:
+                fake_ratio = float(row.get("fake_auction_ratio", 0.0) or 0.0)
+                if fake_ratio >= FAKE_AUCTION_THRESH:
+                    continue
+
+            # ── ★ v5.0 炸板后再封陷阱检测 ──────────────────────────
+            if FILTER_RECLOSE_TRAP:
+                reclose_cnt = int(row.get("reclose_trap_cnt", 0) or 0)
+                if reclose_cnt > RECLOSE_TRAP_MAX:
+                    continue
+
+            # ── ★ v6.0 情绪综合评分过滤（竞价策略）─────────────────
+            score_a = float(row.get("signal_score", 50.0) or 50.0)
+            if SIGNAL_SCORE_ENABLE and score_a < SIGNAL_SCORE_MIN_AUCTION:
+                continue
+
+        # ★ v5.0 信号执行随机延迟
+        if SIGNAL_DELAY_RANDOM:
+            _local_rng = random.Random(SIGNAL_DELAY_SEED)
+            if _local_rng.random() < 0.30:
+                continue
+
+        # ★ v6.0 动态持仓天数
+        score_a = float(row.get("signal_score", 50.0) or 50.0)
+        if DYNAMIC_HOLD_ENABLE:
+            if score_a >= DYNAMIC_HOLD_HIGH_THRESH:
+                _dyn_hold = HOLD_DAYS_STRONG
+            elif score_a <= DYNAMIC_HOLD_LOW_THRESH:
+                _dyn_hold = HOLD_DAYS_WEAK
+            else:
+                _dyn_hold = HOLD_DAYS
+        else:
+            _dyn_hold = HOLD_DAYS
+
         entry_p    = round(open_p * (1 + SLIP + COMMISSION), 4)
         entry_date = str(row["date"])[:10]
-        # ★ 优化⑧：传入 ATR 动态止损幅度
         atr_stop = float(row.get("atr_stop_pct", STOP_LOSS) or STOP_LOSS)
-        exit_date, exit_p, reason, hdays = simulate_exit(df, i + 1, entry_p, atr_stop)
+        _trade_rng = random.Random()
+        exit_date, exit_p, reason, hdays = simulate_exit(df, i + 1, entry_p, atr_stop, _trade_rng, _dyn_hold)
         pnl = (exit_p - entry_p) / entry_p
 
         trades.append(Trade(
@@ -1019,17 +1382,25 @@ def backtest_auction_board(code: str, df: pd.DataFrame) -> list:
             bomb_30d=int(bomb_30d),
             avg_amplitude=round(avg_amp, 2),
             avg_amount_m=round(avg_amt_m, 1),
+            signal_score=round(score_a, 1),
+            dynamic_hold=_dyn_hold,
         ))
 
     return trades
 
 
 # ================================================================
-# 策略4：跌停反包
+# 策略4：跌停反包（v6.0 质量升级版）
 # ================================================================
 def backtest_dt_recover(code: str, df: pd.DataFrame) -> list:
     """
-    信号：昨日跌停，今日开盘相对昨收涨幅 ≥ 3%（情绪修复）
+    信号：昨日跌停，今日开盘相对昨收涨幅 ≥ DT_RECOVER_MIN_OPEN_CHG（情绪修复）
+    ★ v6.0 反包质量升级：
+      - 仅做单次恐慌跌停（连续跌停=基本面利空，不做）
+      - 检测跌停前5日动量，已在下跌通道的不做
+      - 开盘涨幅门槛从3%提高到4%，确保情绪真实修复
+      - 加入情绪评分过滤（反包天然评分低，门槛适当放低）
+      - 动态持仓天数（反包强信号延长，弱信号快出）
     """
     trades = []
     n = len(df)
@@ -1053,27 +1424,68 @@ def backtest_dt_recover(code: str, df: pd.DataFrame) -> list:
             continue
 
         open_chg = (open_p - prev_close) / prev_close
-        if open_chg < 0.03:
+        # ★ v6.0：开盘涨幅门槛提高到4%（原3%），确保情绪修复是真实的
+        if open_chg < DT_RECOVER_MIN_OPEN_CHG:
             continue
 
-        # ── 反包过滤：量比≥1.5 + 振幅1.5~6% + 炸板历史 ──────────
+        # ── 基础过滤：量比 + 振幅 + 流动性 ──────────────────────
         if vol_ratio < VOL_RATIO_LOW:
             continue
-        avg_amp  = float(row.get("avg_amp_20d", 0.0) or 0.0)
-        bomb_30d = int(row.get("bomb_30d", 0))
+        avg_amp   = float(row.get("avg_amp_20d", 0.0) or 0.0)
+        bomb_30d  = int(row.get("bomb_30d", 0))
         avg_amt_m = float(row.get("avg_amt_20d", 0.0) or 0.0)
-        if avg_amp > 0 and (avg_amp < 1.5 or avg_amp > 6.0):  # 振幅上限6%
+        if avg_amp > 0 and (avg_amp < 1.5 or avg_amp > 6.0):
             continue
-        if bomb_30d > FILTER_BOMB_HISTORY_MAX:       # 反包也要求炸板干净
+        if bomb_30d > FILTER_BOMB_HISTORY_MAX:
             continue
         if avg_amt_m > 0 and avg_amt_m * 1e6 < FILTER_MIN_AVG_AMOUNT:
             continue
 
+        # ── ★ v6.0 反包质量过滤（核心新增）────────────────────────
+        if DT_RECOVER_QUALITY_FILTER:
+            # 过滤1：连续跌停 = 基本面持续利空，不做反包
+            dt_s = int(prev_row.get("dt_streak", 1))
+            if dt_s > DT_RECOVER_MAX_STREAK:
+                continue  # 连续跌停超过阈值，属于基本面下行，反包失败率极高
+
+            # 过滤2：跌停前5日已大跌 = 已在下跌通道，非恐慌性单次跌停
+            mom5_before = float(prev_row.get("mom_5d", 0.0) or 0.0)
+            if mom5_before < DT_RECOVER_MIN_MOM5:
+                continue  # 跌停前5日跌幅超15%，趋势性下跌，反包胜率极低
+
+        # ── ★ v5.0 炸板后再封陷阱检测 ──────────────────────────────
+        if FILTER_RECLOSE_TRAP:
+            reclose_cnt = int(row.get("reclose_trap_cnt", 0) or 0)
+            if reclose_cnt > RECLOSE_TRAP_MAX:
+                continue
+
+        # ── ★ v6.0 情绪综合评分过滤（反包门槛较低）───────────────
+        score_r = float(row.get("signal_score", 50.0) or 50.0)
+        if SIGNAL_SCORE_ENABLE and score_r < SIGNAL_SCORE_MIN_RECOVER:
+            continue
+
+        # ★ v5.0 信号执行随机延迟
+        if SIGNAL_DELAY_RANDOM:
+            _local_rng = random.Random(SIGNAL_DELAY_SEED)
+            if _local_rng.random() < 0.30:
+                continue
+
+        # ★ v6.0 动态持仓天数
+        if DYNAMIC_HOLD_ENABLE:
+            if score_r >= DYNAMIC_HOLD_HIGH_THRESH:
+                _dyn_hold = HOLD_DAYS_STRONG
+            elif score_r <= DYNAMIC_HOLD_LOW_THRESH:
+                _dyn_hold = HOLD_DAYS_WEAK
+            else:
+                _dyn_hold = HOLD_DAYS
+        else:
+            _dyn_hold = HOLD_DAYS
+
         entry_p    = round(open_p * (1 + SLIP + COMMISSION), 4)
         entry_date = str(row["date"])[:10]
-        # ★ 优化⑧：传入 ATR 动态止损幅度
         atr_stop = float(row.get("atr_stop_pct", STOP_LOSS) or STOP_LOSS)
-        exit_date, exit_p, reason, hdays = simulate_exit(df, i + 1, entry_p, atr_stop)
+        _trade_rng = random.Random()
+        exit_date, exit_p, reason, hdays = simulate_exit(df, i + 1, entry_p, atr_stop, _trade_rng, _dyn_hold)
         pnl = (exit_p - entry_p) / entry_p
 
         trades.append(Trade(
@@ -1083,6 +1495,10 @@ def backtest_dt_recover(code: str, df: pd.DataFrame) -> list:
             exit_reason=reason, pnl_pct=round(pnl, 4),
             holding_days=hdays, zt_days=-1,
             vol_ratio=round(vol_ratio, 2),
+            avg_amplitude=round(avg_amp, 2),
+            avg_amount_m=round(avg_amt_m, 1),
+            signal_score=round(score_r, 1),
+            dynamic_hold=_dyn_hold,
         ))
 
     return trades
@@ -1461,6 +1877,31 @@ def print_report(stats: dict, trades: list) -> None:
         print(f"  资金管理说明      : 每笔 {POSITION_SIZE:.0%} 仓位，最多 {MAX_POSITIONS} 只同持")
         print(f"  注：量比为日线近似值（非真实盘中量比），换手率用量比替代（实盘需实际数据）")
 
+    # ★ v5.0：反收割模块状态展示
+    print(f"\n  ── 反收割模块状态（v5.0）──")
+    print(f"  止损位随机化      : {'✅开启' if STOP_JITTER_ENABLE else '❌关闭'}"
+          f"  扰动幅度 ±{STOP_JITTER_RANGE:.1%}")
+    print(f"  止盈反整数化      : {'✅开启' if PROFIT_JITTER_ENABLE else '❌关闭'}"
+          f"  扰动幅度 ±{PROFIT_JITTER_RANGE:.1%}")
+    print(f"  竞价钓鱼盘检测    : {'✅开启' if FILTER_FAKE_AUCTION else '❌关闭'}"
+          f"  过滤阈值 ≥{FAKE_AUCTION_THRESH:.0%} (近{FAKE_AUCTION_LOOKBACK}日)")
+    print(f"  再封陷阱检测      : {'✅开启' if FILTER_RECLOSE_TRAP else '❌关闭'}"
+          f"  触发上限 >{RECLOSE_TRAP_MAX}次 (近{RECLOSE_TRAP_DAYS}日)")
+    print(f"  信号随机延迟      : {'⚠️开启(影响回测)' if SIGNAL_DELAY_RANDOM else '❌关闭(实盘按需开启)'}")
+
+    # ★ v6.0：智能化模块状态展示
+    print(f"\n  ── 智能化模块状态（v6.0）──")
+    print(f"  量价背离过滤      : {'✅开启' if FILTER_VOL_PRICE_DIVERGE else '❌关闭'}"
+          f"  阈值 量<均量×{VOL_PRICE_DIVERGE_THRESH:.0%}")
+    print(f"  情绪综合评分      : {'✅开启' if SIGNAL_SCORE_ENABLE else '❌关闭'}"
+          f"  首板≥{SIGNAL_SCORE_MIN_FIRST:.0f} 竞价≥{SIGNAL_SCORE_MIN_AUCTION:.0f} 反包≥{SIGNAL_SCORE_MIN_RECOVER:.0f}")
+    print(f"  动态持仓天数      : {'✅开启' if DYNAMIC_HOLD_ENABLE else '❌关闭'}"
+          f"  强势{HOLD_DAYS_STRONG}天(≥{DYNAMIC_HOLD_HIGH_THRESH:.0f}分) 默认{HOLD_DAYS}天 弱势{HOLD_DAYS_WEAK}天(≤{DYNAMIC_HOLD_LOW_THRESH:.0f}分)")
+    print(f"  反包质量过滤      : {'✅开启' if DT_RECOVER_QUALITY_FILTER else '❌关闭'}"
+          f"  连跌≤{DT_RECOVER_MAX_STREAK}次 前5日动量≥{DT_RECOVER_MIN_MOM5:.0%} 开盘≥{DT_RECOVER_MIN_OPEN_CHG:.0%}")
+    print(f"  T2量能自适应      : {'✅开启' if T2_VOL_ADAPTIVE_ENABLE else '❌关闭'}"
+          f"  指数={T2_VOL_ADAPTIVE_POWER} 容忍率[{T2_VOL_ADAPTIVE_MIN:.0%}~{T2_VOL_ADAPTIVE_MAX:.0%}]")
+
     # ★ v4.0：按年度统计
     yearly = stats.get("yearly_stats", {})
     if yearly:
@@ -1598,6 +2039,55 @@ def factor_analysis_report(trades: list) -> None:
             delta = active["pnl_pct"].mean() - dull["pnl_pct"].mean()
             print(f"\n  → 活跃股vs迟钝股收益差：{delta:+.2%}"
                   f"（{'活跃股胜率更高，优先选活跃股' if delta > 0 else '差异不显著'}）")
+
+    # ── ★ v6.0 信号评分分组胜率（验证评分系统有效性）──
+    if "signal_score" in df.columns and df["signal_score"].sum() > 0:
+        def score_bucket(s):
+            if s < 40:  return "低分(<40)"
+            if s < 55:  return "中低(40~55)"
+            if s < 70:  return "中高(55~70)"
+            return "高分(≥70)"
+        df["score_bucket"] = df["signal_score"].apply(score_bucket)
+        print("\n  ── ★ v6.0 信号评分分组胜率（评分系统有效性验证）──")
+        print(f"  {'评分区间':<14}{'笔数':>6}{'胜率':>8}{'均收益':>9}{'均持仓':>8}")
+        print("  " + "-"*48)
+        for bucket in ["低分(<40)", "中低(40~55)", "中高(55~70)", "高分(≥70)"]:
+            sub = df[df["score_bucket"] == bucket]
+            if len(sub) == 0: continue
+            wins = sub[sub["pnl_pct"] > 0]
+            print(
+                f"  {bucket:<14}{len(sub):>6}  "
+                f"{len(wins)/len(sub):>6.1%}  "
+                f"{sub['pnl_pct'].mean():>+7.2%}  "
+                f"{sub['holding_days'].mean():>5.1f}天"
+            )
+        hi = df[df["signal_score"] >= 70]
+        lo = df[df["signal_score"] < 40]
+        if len(hi) >= 5 and len(lo) >= 5:
+            delta = hi["pnl_pct"].mean() - lo["pnl_pct"].mean()
+            print(f"\n  → 高分vs低分收益差：{delta:+.2%}"
+                  f"（{'✅评分系统有效' if delta > 0.02 else '⚠️评分系统需校准'}）")
+
+    # ── ★ v6.0 动态持仓天数有效性验证 ──
+    if "dynamic_hold" in df.columns and df["dynamic_hold"].sum() > 0:
+        def hold_tier(h):
+            if h <= HOLD_DAYS_WEAK:    return f"弱势({HOLD_DAYS_WEAK}天)"
+            if h >= HOLD_DAYS_STRONG:  return f"强势({HOLD_DAYS_STRONG}天)"
+            return f"默认({HOLD_DAYS}天)"
+        df["hold_tier"] = df["dynamic_hold"].apply(hold_tier)
+        print(f"\n  ── ★ v6.0 动态持仓分组收益（验证持仓天数调整有效性）──")
+        print(f"  {'持仓档位':<14}{'笔数':>6}{'胜率':>8}{'均收益':>9}{'实际均持仓':>10}")
+        print("  " + "-"*50)
+        for tier in [f"强势({HOLD_DAYS_STRONG}天)", f"默认({HOLD_DAYS}天)", f"弱势({HOLD_DAYS_WEAK}天)"]:
+            sub = df[df["hold_tier"] == tier]
+            if len(sub) == 0: continue
+            wins = sub[sub["pnl_pct"] > 0]
+            print(
+                f"  {tier:<14}{len(sub):>6}  "
+                f"{len(wins)/len(sub):>6.1%}  "
+                f"{sub['pnl_pct'].mean():>+7.2%}  "
+                f"{sub['holding_days'].mean():>7.1f}天"
+            )
 
     # ── 策略 × 量比 交叉表 ──
     print("\n  ── 策略 × 量比 交叉胜率 ──")
