@@ -1,29 +1,41 @@
-name: 打板策略回测
+name: 打板策略回测 v6.0
 
 on:
   workflow_dispatch:
     inputs:
       start_date:
-        description: "回测开始日期（YYYY-MM-DD，留空用默认值 2021-01-01）"
+        description: "回测开始日期（YYYY-MM-DD，留空默认 2021-01-01）"
         required: false
         default: ""
       end_date:
         description: "回测结束日期（YYYY-MM-DD，留空=今天）"
         required: false
         default: ""
-      max_stocks:
-        description: "最多回测股票数（0=全量）"
+      codes:
+        description: "指定股票代码，空格分隔（留空=全市场股票池）"
         required: false
-        default: "0"
+        default: ""
+      strategy:
+        description: "策略（首板/连板/竞价/反包，逗号分隔，留空=全部）"
+        required: false
+        default: ""
+      max_stocks:
+        description: "最多回测股票数（0=全量，建议先用 200 测试）"
+        required: false
+        default: "200"
+      factor_analysis:
+        description: "是否输出多因子分析报告（true/false）"
+        required: false
+        default: "true"
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   backtest:
-    name: 打板策略回测
+    name: 打板策略回测 v6.0
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 180
 
     steps:
       - name: 检出代码
@@ -41,17 +53,22 @@ jobs:
           pip install -r requirements.txt
 
       - name: 运行回测
-        env:
-          SENDKEY: ${{ secrets.SENDKEY }}
         run: |
           START="${{ github.event.inputs.start_date }}"
           END="${{ github.event.inputs.end_date }}"
+          CODES="${{ github.event.inputs.codes }}"
+          STRAT="${{ github.event.inputs.strategy }}"
           MAX="${{ github.event.inputs.max_stocks }}"
+          FA="${{ github.event.inputs.factor_analysis }}"
 
-          CMD="python daban_backtest.py --plot --factor-analysis --csv daban_trades.csv"
+          CMD="python daban_backtest.py --plot --csv daban_trades.csv"
+
           [ -n "$START" ] && CMD="$CMD --start $START"
           [ -n "$END"   ] && CMD="$CMD --end $END"
           [ -n "$MAX"   ] && [ "$MAX" != "0" ] && CMD="$CMD --max-stocks $MAX"
+          [ -n "$CODES" ] && CMD="$CMD --codes $CODES"
+          [ -n "$STRAT" ] && CMD="$CMD --strategy $(echo $STRAT | tr ',' ' ')"
+          [ "$FA" = "true" ] && CMD="$CMD --factor-analysis"
 
           echo "执行命令：$CMD"
           eval $CMD
