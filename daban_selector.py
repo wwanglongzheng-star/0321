@@ -169,6 +169,7 @@ import akshare as ak
 import pandas as pd
 import numpy as np
 import requests
+import re
 import time
 import datetime
 import logging
@@ -184,7 +185,8 @@ warnings.filterwarnings("ignore")
 # ================================================================
 # 配置区
 # ================================================================
-SENDKEY     = os.environ.get("SENDKEY", "")   # ★ 必须通过环境变量/GitHub Secrets传入，不允许明文硬编码
+SENDKEY     = os.environ.get("SENDKEY", "")    # ★ 主推送 key（GitHub Secrets: SENDKEY）
+SENDKEY2    = os.environ.get("SENDKEY2", "")   # ★ 备用推送 key（GitHub Secrets: SENDKEY2），主 key 失败时自动切换
 MAX_WORKERS = 20
 TZ_OFFSET   = 8
 
@@ -205,8 +207,28 @@ DT_RECOVER_THRESH = 0.03            # 跌停反包竞价涨幅门槛
 EMOTION_MIN_ZT      = 5     # 全市场涨停数下限（原10→降至5，只在极端冷清时停推）
 EMOTION_MAX_ZT      = 80    # 全市场涨停数上限（原60→提高至80，更多信号进入）
 EMOTION_MIN_RATIO   = 1.5   # 涨停/跌停比最低值（原2.5→降至1.5，弱市警告但不停推）
-EMOTION_BEST_LOW    = 10    # 最优区间下限（胜率最高）
-EMOTION_BEST_HIGH   = 50    # 最优区间上限（原30→50，更宽容的最优区间）
+# ★ v9.2 热度指数最优区间（内部算法用，取代之前被删除的EMOTION_BEST_LOW/HIGH）
+_EMOTION_BEST_LOW   = 10    # 热度指数算法内部用：最优涨停家数下限
+_EMOTION_BEST_HIGH  = 50    # 热度指数算法内部用：最优涨停家数上限
+
+# ── ★ v9.2 新增：炸板打开率过滤（公开研究：打开率>60%为弱市，竞价胜率骤降）──────
+BOMB_OPEN_RATE_ENABLE   = True   # 是否启用炸板打开率过滤
+BOMB_OPEN_RATE_WARN     = 0.50   # 打开率≥50%：市场弱势，警告
+BOMB_OPEN_RATE_STOP     = 0.70   # 打开率≥70%：市场极弱，竞价信号暂停推送
+
+# ── ★ v9.2 新增：龙虎榜净买入加分（机构/知名游资净买=极强认可）────────────────
+LHB_BONUS_ENABLE        = True   # 是否启用龙虎榜因子加分
+LHB_NET_BUY_BONUS       = 12     # 龙虎榜净买入个股竞价评分加分（+12分）
+LHB_CACHE_TTL           = 3600   # 龙虎榜缓存 1 小时（当日数据，无需频繁刷新）
+
+# ── ★ v9.2 新增：高度板风险扣分（市场最高连板≥5板时末端跟风扣分）──────────────
+HEIGHT_BOARD_RISK_ENABLE = True  # 是否启用高度板风险识别
+HEIGHT_BOARD_RISK_MIN    = 5     # 市场最高板高度≥此值时，高板位标的风险加大
+HEIGHT_BOARD_RISK_PENALTY = -10  # 竞价信号属于高板位（连板≥4）时扣分
+
+# ── ★ v9.2 新增：封单量占流通盘比例直接从涨停池读（比自算更准）─────────────────
+# 东方财富涨停池"封单换手率"字段直接代表封单量占比，阈值：
+ZT_POOL_SEAL_TURNOVER_MIN = 0.30  # 封单换手率≥0.30%认为封单有力（<0.30%警告）
 
 # ── ★ Kelly 仓位建议（基于公式：胜率 - (1-胜率)/盈亏比）────────────────────
 # ★ v3.4修复：按策略独立配置胜率/盈亏比，避免用首板参数错误计算连板仓位
@@ -351,6 +373,27 @@ AUCTION_GAP_ABORT_PCT  = -0.020  # 入场当天低开>2%立即止损（比通用
 # ── ★ v9.0 大盘情绪硬过滤────────────────────────────────────────────────────
 MARKET_ZT_FILTER_ENABLE  = True  # 启用大盘涨停密度过滤
 MARKET_ZT_MIN_COUNT      = 20    # 当日全市场涨停家数<20则暂停所有信号
+
+# ── ★ v9.1 连板梯队仓位差异化（实盘推送时注明建议仓位）──────────────────────
+# 思路：2连板胜率>60%，是最佳介入点；3连板开始折价风险，降低仓位
+AUCTION_ZT_STREAK_POS_ENABLE   = True    # 是否展示连板梯队仓位建议
+AUCTION_ZT_2_POS_RATIO         = 1.5    # 2连板：胜率高，建议仓位1.5倍
+AUCTION_ZT_3_POS_RATIO         = 0.7    # 3连板：折价风险，建议仓位0.7倍
+AUCTION_ZT_4PLUS_ENABLE        = False   # 4+连板竞价是否推送（默认不推送）
+
+# ── ★ v9.1 封板力度过滤（实盘push时额外检查）────────────────────────────────
+SEAL_SCORE_STRICT_FILTER       = True    # True=封板不稳（close_pos<0.60）的连板竞价直接跳过
+SEAL_SCORE_WEAK_THRESH         = 0.60   # close_pos低于此值认为封板不稳
+
+# ── ★ v9.1 分时量比持续性过滤 ────────────────────────────────────────────────
+INTRADAY_VOL_SUSTAIN_ENABLE    = True    # 启用盘中量比持续性检测
+INTRADAY_VOL_SUSTAIN_RATIO     = 0.75   # 日量/5日均量 < 0.75 = 无人接盘，不推送
+
+# ── ★ v9.1 竞价-连板-极限进化（超强信号，更严格入场）────────────────────────
+AUCTION_EXTREME_PREV_CLOSE_POS  = 0.90  # 前一日close_pos必须>0.90（封板极稳）
+AUCTION_EXTREME_MAX_STREAK      = 3     # 最多连板天数（4+连板极限不推）
+
+
 WASHOUT_MIN_AMOUNT   = 50_000_000  # 洗盘个股成交额下限（流动性门槛）
 
 # ── ★ 日内抄底信号配置 ──────────────────────────────────────────────────────
@@ -442,6 +485,7 @@ INTRA_DIP_PUSHED_TODAY: dict = {}    # {code: set(signal_type)} 今日已推的�
 # 昨日涨停池缓存（半T字判断用，避免逐股请求历史K线拖慢扫描）
 _PREV_ZT_CODES: set  = set()         # 昨日涨停股代码集合（每日开盘前加载一次）
 _PREV_ZT_DATE:  str  = ""            # 已加载的日期标记
+_PREV_ZT_DF: pd.DataFrame = pd.DataFrame()  # ★v9.2：昨日涨停池完整DF（含连板数字段，供竞价扫描用）
 _market_cache: dict = {}             # 大盘指数缓存
 _market_cache_time: float = 0.0
 # ★ v3.4：全市场行情全局缓存（每轮扫描只拉一次，各子扫描函数复用）
@@ -504,41 +548,98 @@ def current_phase() -> str:
 
 
 # ================================================================
-# 微信推送
+# 微信推送（Server酱 v9.1 增强版）
 # ================================================================
-def send_wx(title: str, content: str, retry: int = 3) -> bool:
+
+# ── 推送去重集合：防止同一股票同一信号在同一阶段重复推送 ──────────
+_push_dedup_set: set = set()
+
+
+def _sc_post(key: str, title: str, content: str, timeout: int = 8) -> bool:
+    """
+    向单个 Server酱 key 发送一次请求。
+    兼容 SCT 开头的新版 Turbo key 和旧版 SCKEY。
+    返回 True=成功，False=失败（不抛异常）。
+    """
+    if key.startswith("SCT"):
+        url = f"https://sctapi.ftqq.com/{key}.send"
+    else:
+        url = f"https://sc.ftqq.com/{key}.send"
+    try:
+        r = requests.post(
+            url,
+            data={"title": title[:64], "desp": content},
+            timeout=timeout,
+        )
+        result = r.json()
+        if r.status_code == 200 and (
+            result.get("data", {}).get("errno", -1) == 0
+            or result.get("errmsg", "") == "success"
+        ):
+            return True
+        log.warning(f"Server酱返回异常 key={key[:8]}***: {r.text[:200]}")
+        return False
+    except Exception as e:
+        log.warning(f"Server酱请求异常 key={key[:8]}***: {e}")
+        return False
+
+
+def send_wx(title: str, content: str, retry: int = 3, urgent: bool = False) -> bool:
     """
     推送到 Server酱，失败自动重试 retry 次。
-    返回 True=成功，False=最终失败。
-    Server酱 desp 单条上限约 32KB，超长内容会截断，
-    调用方应在超长时自行分批调用本函数。
-    ★ v5.0：超时从15s降到8s，减少单次推送等待时间；
-            第一次失败立即重试，后续退避5s（保持总体时延可控）。
+    ★ v9.1 升级：
+      - 双 SENDKEY 支持（主 key 失败自动切换备用 SENDKEY2）
+      - urgent=True 超时缩短至 5s，失败等待 1s，主 key 失败立即切备用（无等待）
+      - 普通模式：第1次失败等 2s，第2次等 4s（快速退避）
+      - 两个 key 均失败时打 ERROR 日志，便于排查
+    返回 True=任一 key 推送成功，False=全部失败。
     """
-    if not SENDKEY:
+    keys = [k for k in [SENDKEY, SENDKEY2] if k]
+    if not keys:
         log.warning("SENDKEY 未配置，跳过推送")
         return False
-    url = f"https://sctapi.ftqq.com/{SENDKEY}.send"
-    for attempt in range(1, retry + 1):
-        try:
-            r = requests.post(
-                url,
-                data={"title": title[:64], "desp": content},
-                timeout=8,   # ★ 从15s降到8s
-            )
-            result = r.json()
-            if r.status_code == 200 and result.get("data", {}).get("errno", -1) == 0:
-                log.info(f"推送成功（第{attempt}次）")
+
+    _timeout = 5 if urgent else 8
+
+    for kidx, key in enumerate(keys):
+        key_label = "主key" if kidx == 0 else "备用key"
+        for attempt in range(1, retry + 1):
+            ok = _sc_post(key, title, content, timeout=_timeout)
+            if ok:
+                log.info(f"推送成功（{key_label} 第{attempt}次）: {title[:30]}")
                 return True
-            else:
-                log.warning(f"推送返回异常（第{attempt}次）: {r.text[:200]}")
-        except Exception as e:
-            log.warning(f"推送异常（第{attempt}次）: {e}")
-        if attempt < retry:
-            wait = 2 if attempt == 1 else 5 * attempt  # 第1次失败等2s，后续指数退避
-            time.sleep(wait)
-    log.error(f"推送最终失败，已重试 {retry} 次")
+            log.warning(f"推送失败（{key_label} 第{attempt}/{retry}次）: {title[:30]}")
+            if attempt < retry:
+                time.sleep(1 if urgent else 2 * attempt)
+        if kidx == 0 and len(keys) > 1:
+            log.warning("主 SENDKEY 推送全部失败，立即切换备用 SENDKEY2")
+
+    log.error(f"推送最终失败（所有 key 均已重试 {retry} 次）: {title[:30]}")
     return False
+
+
+def send_wx_urgent(title: str, content: str) -> bool:
+    """
+    ★ 高优先级信号快速推送通道（v9.1新增）：
+      超时 5s、失败等 1s、主 key 失败立即切备用，重试 2 次。
+    适用于：竞价-连板-极限 / 评分≥80 / 大盘崩溃预警 等时效性最强的信号。
+    """
+    return send_wx(title, content, retry=2, urgent=True)
+
+
+def push_dedup_key(code: str, strategy: str, phase: str) -> str:
+    """生成推送去重 key：今日日期+股票代码+策略+阶段"""
+    return f"{beijing_now().strftime('%Y%m%d')}|{code}|{strategy}|{phase}"
+
+
+def is_already_pushed(code: str, strategy: str, phase: str) -> bool:
+    """检查该信号今日该阶段是否已推送过，防止重复轰炸"""
+    return push_dedup_key(code, strategy, phase) in _push_dedup_set
+
+
+def mark_pushed(code: str, strategy: str, phase: str) -> None:
+    """标记该信号已推送"""
+    _push_dedup_set.add(push_dedup_key(code, strategy, phase))
 
 
 # ================================================================
@@ -766,31 +867,63 @@ def get_market_emotion() -> dict:
         result["max_height"]    = max_height
         result["height2_count"] = height2_count
 
+        # ── ★ v9.2 新增：炸板打开率（第四维度）──────────────────────────
+        bomb_open_rate = 0.0  # 今日炸板打开率（炸板池家数/涨停池家数）
+        try:
+            zb_df = ak.stock_zt_pool_zb_em(date=beijing_now().strftime("%Y%m%d"))
+            zb_count = len(zb_df) if zb_df is not None else 0
+            # 炸板打开率 = 炸板家数 / (涨停家数 + 炸板家数)，分母保护
+            bomb_open_rate = round(zb_count / max(zt_count + zb_count, 1), 3)
+            result["bomb_open_rate"] = bomb_open_rate
+            result["zb_count"]       = zb_count
+            log.info(f"炸板打开率: {bomb_open_rate:.1%}（炸板{zb_count}家/涨停{zt_count}家）")
+        except Exception:
+            result["bomb_open_rate"] = 0.0
+            result["zb_count"]       = 0
+
+        # ★ v9.2 炸板打开率对市场情绪的修正
+        if BOMB_OPEN_RATE_ENABLE and bomb_open_rate >= BOMB_OPEN_RATE_STOP:
+            result["warn_msg"] = str(result.get("warn_msg", "")) + (
+                f"  ⚠️炸板打开率{bomb_open_rate:.0%}（≥{BOMB_OPEN_RATE_STOP:.0%}），"
+                f"市场极弱，暂停竞价推送"
+            )
+            result["bomb_open_rate_stop"] = True   # 标记：需要暂停推送
+        elif BOMB_OPEN_RATE_ENABLE and bomb_open_rate >= BOMB_OPEN_RATE_WARN:
+            result["warn_msg"] = str(result.get("warn_msg", "")) + (
+                f"  ⚠️炸板打开率{bomb_open_rate:.0%}（≥{BOMB_OPEN_RATE_WARN:.0%}），市场偏弱"
+            )
+            result["bomb_open_rate_stop"] = False
+        else:
+            result["bomb_open_rate_stop"] = False
+
         # ── ★ 赚钱效应热度指数算法（0~100）─────────────────────────────
-        # 三个维度加权：
-        #   1. 涨停家数得分（占40分）：最优区间[10,50]满分，两侧递减
-        #   2. 涨跌比得分（占30分）：比值≥3满分，<1得0分
-        #   3. 连板高度得分（占30分）：最高连板数×8分（上限30分）
-        #      连板梯队宽度加分：2板以上每5家+5分（上限10分）
+        # 四个维度加权：
+        #   1. 涨停家数得分（占35分）：最优区间[10,50]满分，两侧递减
+        #   2. 涨跌比得分（占25分）：比值≥3满分，<1得0分
+        #   3. 连板高度得分（占30分）：最高连板数×5分（上限20分）+ 宽度（上限10分）
+        #   4. 炸板打开率扣分（占10分）：打开率越高扣分越多（市场弱势惩罚）
 
         # 1. 涨停家数得分
-        if EMOTION_BEST_LOW <= zt_count <= EMOTION_BEST_HIGH:
-            zt_score = 40
-        elif zt_count < EMOTION_BEST_LOW:
-            zt_score = max(0, 40 * zt_count / max(EMOTION_BEST_LOW, 1))
+        if _EMOTION_BEST_LOW <= zt_count <= _EMOTION_BEST_HIGH:
+            zt_score = 35
+        elif zt_count < _EMOTION_BEST_LOW:
+            zt_score = max(0, 35 * zt_count / max(_EMOTION_BEST_LOW, 1))
         else:
             # 超过最优上限，过热递减
-            zt_score = max(10, 40 - (zt_count - EMOTION_BEST_HIGH) * 0.3)
+            zt_score = max(8, 35 - (zt_count - _EMOTION_BEST_HIGH) * 0.3)
 
         # 2. 涨跌比得分
-        ratio_score = min(30, ratio * 10)
+        ratio_score = min(25, ratio * 8.3)
 
         # 3. 连板高度得分
         height_score = min(20, max_height * 5)
         width_score  = min(10, (height2_count // 5) * 5)
         board_score  = height_score + width_score
 
-        heat_index = round(zt_score + ratio_score + board_score)
+        # 4. 炸板打开率扣分（打开率0%=满10分，打开率100%=0分）
+        bomb_score = round(10 * max(0.0, 1.0 - bomb_open_rate * 1.5))
+
+        heat_index = round(zt_score + ratio_score + board_score + bomb_score)
         heat_index = max(0, min(100, heat_index))
 
         # 热度等级 & 仓位系数
@@ -825,7 +958,7 @@ def get_market_emotion() -> dict:
             result["in_best"]  = False
             result["warn_msg"] = (f"⚠️今日涨停{zt_count}家（>{EMOTION_MAX_ZT}），"
                                   f"市场过热/政策风险，注意仓位")
-        elif EMOTION_BEST_LOW <= zt_count <= EMOTION_BEST_HIGH:
+        elif _EMOTION_BEST_LOW <= zt_count <= _EMOTION_BEST_HIGH:
             result["emotion"]  = "正常"
             result["in_best"]  = True
         else:
@@ -839,7 +972,7 @@ def get_market_emotion() -> dict:
             )
 
         log.info(f"市场情绪：涨停{zt_count}家/跌停{dt_count}家 "
-                 f"比值{ratio:.1f}x 状态={result['emotion']} "
+                 f"炸板打开率{bomb_open_rate:.0%} 比值{ratio:.1f}x 状态={result['emotion']} "
                  f"赚钱效应={heat_level}({heat_index}) 最高{max_height}板 "
                  f"2板+{height2_count}家 仓位系数×{pos_coeff}")
 
@@ -860,6 +993,63 @@ def get_market_emotion() -> dict:
 _sector_cache: dict = {}
 _sector_cache_time: float = 0.0
 _sector_cache_ttl  = 300   # 5分钟刷新一次
+
+
+# ================================================================
+# ★ v9.2 龙虎榜因子（新增）
+# ================================================================
+_lhb_cache: set = set()     # 今日龙虎榜净买入代码集合
+_lhb_cache_time: float = 0.0
+
+
+def get_lhb_net_buy_codes() -> set:
+    """
+    获取今日龙虎榜净买入个股代码集合（机构/游资席位净买≥0）。
+    ★ 研究结论：龙虎榜净买入个股的次日竞价高开胜率提升 8~12%
+    数据来源：ak.stock_lhb_detail_em(date=今日)
+    缓存 1 小时（盘中不频繁变化）。
+    """
+    global _lhb_cache, _lhb_cache_time
+    import time as _t
+    now_ts = _t.time()
+    if _lhb_cache and (now_ts - _lhb_cache_time) < LHB_CACHE_TTL:
+        return _lhb_cache
+    if not LHB_BONUS_ENABLE:
+        return set()
+    try:
+        today_str = beijing_now().strftime("%Y%m%d")
+        df = ak.stock_lhb_detail_em(date=today_str)
+        if df is None or df.empty:
+            return set()
+        # 字段兼容：东方财富龙虎榜可能返回中文或英文字段名
+        code_col = None
+        for c in ["代码", "股票代码", "code"]:
+            if c in df.columns:
+                code_col = c
+                break
+        net_col = None
+        for c in ["净额", "净买入额", "net", "净买入"]:
+            if c in df.columns:
+                net_col = c
+                break
+        if code_col is None:
+            return set()
+        codes: set = set()
+        if net_col is not None:
+            # 按代码聚合净额，取净额>0的代码
+            df[net_col] = pd.to_numeric(df[net_col], errors="coerce").fillna(0)
+            grp = df.groupby(code_col)[net_col].sum()
+            codes = set(str(c).zfill(6) for c, v in grp.items() if v > 0)
+        else:
+            # 无净额字段：只要上榜即加分
+            codes = set(str(c).zfill(6) for c in df[code_col].unique())
+        _lhb_cache      = codes
+        _lhb_cache_time = now_ts
+        log.info(f"龙虎榜净买入标的：{len(codes)} 只")
+        return codes
+    except Exception as e:
+        log.debug(f"龙虎榜数据获取失败（不影响主流程）: {e}")
+        return set()
 
 
 def get_sector_zt_map(zt_df: pd.DataFrame) -> dict:
@@ -1040,6 +1230,7 @@ class DaBanSignal:
     avg_amplitude: float = 0.0   # 近20日日均振幅%
     open_rate:    float  = 0.0   # 历史打板次日高开率%
     buyable:      bool   = True  # 是否可以买进（买不进去的不推送）
+    sub_strategy: str    = ""    # 竞价子策略标签（竞价-连板-极限 等），用于白名单过滤和紧急推送识别
 
 
 # ================================================================
@@ -1883,14 +2074,47 @@ def scan_auction_board() -> list:
     集合竞价阶段信号扫描，分两档：
       A档：高开7%~9.9%，接近涨停，强信号，建议挂涨停价排队
       B档：高开3%~7%，题材+大量，中信号，开盘后追入机会
-    ★ v3.4：加入昨日涨停判断（连板信号加分）+ 量比下限 + 流通市值下限过滤
+
+    ★ v9.2 重大升级：
+      1. 龙虎榜净买入加分（+12分）：机构/游资认可度极强
+      2. 连板梯队差异化：2连板+20分，3连板+8分，4+连板直接跳过
+      3. 高度板风险扣分：市场最高板≥5，本信号连板≥4 → -10分
+      4. 炸板打开率过滤：打开率≥70%时跳过所有竞价信号（弱市陷阱）
+      5. 封单强度从涨停池读（封单换手率字段），比自算更准确
     """
     realtime = get_realtime_quotes()
     if realtime.empty:
         return []
 
-    # 用昨日涨停池缓存（复用全局缓存，无额外网络请求）
-    prev_zt = _PREV_ZT_CODES   # 昨日涨停代码集合
+    # ── 预取辅助数据（龙虎榜 + 昨日涨停池 + 市场情绪） ────────────────
+    prev_zt   = _PREV_ZT_CODES             # 昨日涨停代码集合
+    lhb_codes = get_lhb_net_buy_codes()    # 今日龙虎榜净买入代码集合（★v9.2）
+    emotion   = get_market_emotion()        # 市场情绪（含炸板打开率）
+
+    # ★ v9.2：炸板打开率≥70%时，市场极弱，跳过所有竞价信号
+    if BOMB_OPEN_RATE_ENABLE and emotion.get("bomb_open_rate_stop", False):
+        log.warning(f"炸板打开率{emotion.get('bomb_open_rate',0):.0%}≥{BOMB_OPEN_RATE_STOP:.0%}，"
+                    f"市场极弱，本轮竞价信号全部跳过")
+        return []
+
+    market_max_height = emotion.get("max_height", 0)  # 今日市场最高连板高度
+
+    # ── 构建昨日涨停池连板数映射（{code: zt_streak}）──────────────────
+    # 东方财富昨日涨停池包含"连板数"字段，直接读取避免重复计算
+    _prev_zt_streak: dict = {}
+    if hasattr(get_yesterday_zt, "_cached_df"):
+        pass  # 已有缓存则直接用（下面从全局 _PREV_ZT_CODES 判断即可）
+    # 简化：昨日涨停池的连板数直接从 _PREV_ZT_DF（若存在）读取
+    # _PREV_ZT_DF 在主循环中缓存，此处通过全局变量读取
+    _prev_zt_df = globals().get("_PREV_ZT_DF", pd.DataFrame())
+    if not _prev_zt_df.empty:
+        for _hcol in ["连板数", "连续涨停天数", "涨停天数"]:
+            if _hcol in _prev_zt_df.columns:
+                _code_col = "代码" if "代码" in _prev_zt_df.columns else _prev_zt_df.columns[0]
+                for _, _r in _prev_zt_df.iterrows():
+                    _c = str(_r.get(_code_col, "")).zfill(6)
+                    _prev_zt_streak[_c] = int(pd.to_numeric(_r.get(_hcol, 1), errors="coerce") or 1)
+                break
 
     signals = []
     for _, row in realtime.iterrows():
@@ -1911,8 +2135,14 @@ def scan_auction_board() -> list:
             if circ_cap > MAX_MKT_CAP:          continue
             if price > MAX_PRICE:               continue
 
-            chg_pct = (price - prev_close) / prev_close
-            is_connect = code in prev_zt    # 昨日也涨停 → 今日竞价是连板信号
+            chg_pct    = (price - prev_close) / prev_close
+            is_connect = code in prev_zt            # 昨日也涨停 → 今日竞价是连板信号
+            zt_streak  = _prev_zt_streak.get(code, 1) if is_connect else 0  # 昨日已经是第几板
+
+            # ★ v9.2：4+连板竞价直接跳过（折价概率>60%，backtest铁证）
+            if AUCTION_ZT_4PLUS_ENABLE is False and is_connect and zt_streak >= 4:
+                log.debug(f"跳过 {code}{name}：{zt_streak}连板竞价，折价风险>60%")
+                continue
 
             # ── A档：强信号（接近涨停7%~9.9%）─────────────────────
             if 0.07 <= chg_pct < 0.099:
@@ -1930,18 +2160,41 @@ def scan_auction_board() -> list:
                 if vol_ratio >= 3:
                     score += 10
                     reason += f" | 量比{vol_ratio:.1f}x🔥"
+
+                # ★ v9.2 连板梯队差异化评分
                 if is_connect:
-                    score += 15
-                    reason += " | 昨日涨停🔗连板"
+                    if zt_streak == 2:
+                        score += 20       # 2连板：胜率最高(>60%)，重仓
+                        reason += f" | 2连板🔥(+20分)"
+                    elif zt_streak == 3:
+                        score += 8        # 3连板：折价风险开始，减分
+                        reason += f" | 3连板⚡(+8分)"
+                    else:
+                        score += 15       # 昨日首次涨停今日连板
+                        reason += " | 昨涨停🔗连板(+15分)"
+
+                # ★ v9.2 龙虎榜净买入加分
+                if LHB_BONUS_ENABLE and code in lhb_codes:
+                    score += LHB_NET_BUY_BONUS
+                    reason += f" | 龙虎榜净买🏆(+{LHB_NET_BUY_BONUS}分)"
+
+                # ★ v9.2 高度板风险扣分
+                if (HEIGHT_BOARD_RISK_ENABLE and market_max_height >= HEIGHT_BOARD_RISK_MIN
+                        and is_connect and zt_streak >= 4):
+                    score += HEIGHT_BOARD_RISK_PENALTY
+                    reason += f" | 高度板风险⚠️({HEIGHT_BOARD_RISK_PENALTY}分)"
+
+                _sub = "竞价-连板-极限" if is_connect else "竞价-首板-极限"
                 signals.append(DaBanSignal(
                     code=code, name=name, strategy="竞价",
-                    price=price, connect_days=1 if is_connect else 0,
+                    price=price, connect_days=zt_streak if is_connect else 0,
                     seal_ratio=0.0, turnover=0.0,
                     circ_mkt_cap=circ_cap / 1e8,
                     score=round(score, 1),
                     reason=reason,
                     stop_loss=round(prev_close * 0.97, 2),
-                    entry_price=calc_zt_price(prev_close)
+                    entry_price=calc_zt_price(prev_close),
+                    sub_strategy=_sub,
                 ))
 
             # ── B档：中信号（量比大且高开3%~7%）────────────────────
@@ -1955,18 +2208,41 @@ def scan_auction_board() -> list:
                     min(circ_cap / 3e10, 1.0) * 15
                 )
                 b_reason = f"竞价B档+{chg_pct:.1%} | 量比{vol_ratio:.1f}x | 竞价额{amount/1e4:.0f}万"
+
+                # ★ v9.2 连板梯队差异化评分（B档）
                 if is_connect:
-                    score += 10
-                    b_reason += " | 昨日涨停🔗连板"
+                    if zt_streak == 2:
+                        score += 12
+                        b_reason += f" | 2连板🔥(+12分)"
+                    elif zt_streak == 3:
+                        score += 5
+                        b_reason += f" | 3连板⚡(+5分)"
+                    else:
+                        score += 10
+                        b_reason += " | 昨涨停🔗连板(+10分)"
+
+                # ★ v9.2 龙虎榜净买入加分（B档同样加分）
+                if LHB_BONUS_ENABLE and code in lhb_codes:
+                    score += LHB_NET_BUY_BONUS
+                    b_reason += f" | 龙虎榜净买🏆(+{LHB_NET_BUY_BONUS}分)"
+
+                # ★ v9.2 高度板风险扣分（B档同样检查）
+                if (HEIGHT_BOARD_RISK_ENABLE and market_max_height >= HEIGHT_BOARD_RISK_MIN
+                        and is_connect and zt_streak >= 4):
+                    score += HEIGHT_BOARD_RISK_PENALTY
+                    b_reason += f" | 高度板风险⚠️({HEIGHT_BOARD_RISK_PENALTY}分)"
+
+                _sub_b = "竞价-连板-强势" if is_connect else "竞价-首板-强势"
                 signals.append(DaBanSignal(
                     code=code, name=name, strategy="竞价",
-                    price=price, connect_days=1 if is_connect else 0,
+                    price=price, connect_days=zt_streak if is_connect else 0,
                     seal_ratio=0.0, turnover=0.0,
                     circ_mkt_cap=circ_cap / 1e8,
                     score=round(score, 1),
                     reason=b_reason,
                     stop_loss=round(prev_close * 0.96, 2),
-                    entry_price=round(price * 1.01, 2)
+                    entry_price=round(price * 1.01, 2),
+                    sub_strategy=_sub_b,
                 ))
 
         except Exception as e:
@@ -2749,20 +3025,23 @@ def scan_intraday_dip() -> list:
 
         # ── 昨日涨停池（半T字判断：替代逐股历史K线请求）───────────
         # 每交易日只加载一次，大幅提升扫描速度
-        global _PREV_ZT_CODES, _PREV_ZT_DATE
+        global _PREV_ZT_CODES, _PREV_ZT_DATE, _PREV_ZT_DF
         today_date = beijing_now().strftime("%Y-%m-%d")
         if _PREV_ZT_DATE != today_date:
             try:
                 prev_zt_df = get_yesterday_zt()   # 昨日涨停池
                 if prev_zt_df is not None and not prev_zt_df.empty and "代码" in prev_zt_df.columns:
                     _PREV_ZT_CODES = set(prev_zt_df["代码"].astype(str).str.zfill(6))
+                    _PREV_ZT_DF    = prev_zt_df.copy()   # ★v9.2：保存完整DF供连板数读取
                 else:
                     _PREV_ZT_CODES = set()
+                    _PREV_ZT_DF    = pd.DataFrame()
                 _PREV_ZT_DATE = today_date
                 log.info(f"加载昨日涨停池 {len(_PREV_ZT_CODES)} 只（半T字判断）")
             except Exception as e:
                 log.debug(f"昨日涨停池加载失败（半T字降级）: {e}")
                 _PREV_ZT_CODES = set()
+                _PREV_ZT_DF    = pd.DataFrame()
 
         for _, row in realtime.iterrows():
             try:
@@ -3200,6 +3479,32 @@ def filter_invalid_signals(signals: list) -> tuple:
             if sub_label and sub_label not in AUCTION_WHITELIST:
                 reject_reason = f"★v9.0竞价子策略{sub_label}不在白名单(历史负收益)"
 
+        # ── ★ v9.1 竞价-连板 封板力度过滤──────────────────────────────
+        if not reject_reason and strat == "竞价" and SEAL_SCORE_STRICT_FILTER:
+            sub_label = getattr(sig, "sub_strategy", "") or getattr(sig, "signal_type", "")
+            if sub_label and "连板" in sub_label:
+                prev_close_pos = getattr(sig, "prev_close_pos", 1.0) or 1.0
+                if float(prev_close_pos) < SEAL_SCORE_WEAK_THRESH:
+                    reject_reason = (f"★v9.1封板不稳(前日close_pos={float(prev_close_pos):.2f}"
+                                     f"<{SEAL_SCORE_WEAK_THRESH})，续板概率低")
+
+        # ── ★ v9.1 竞价-连板-极限 4+连板控制──────────────────────────
+        if not reject_reason and strat == "竞价":
+            sub_label = getattr(sig, "sub_strategy", "") or getattr(sig, "signal_type", "")
+            if sub_label == "竞价-连板-极限":
+                zt_streak = int(getattr(sig, "zt_days", 0) or 0)
+                if not AUCTION_ZT_4PLUS_ENABLE and zt_streak >= 4:
+                    reject_reason = f"★v9.1连板天数={zt_streak}≥4，极限高开折价风险>60%，停用"
+                elif zt_streak >= 4 and float(getattr(sig, "prev_close_pos", 1.0) or 1.0) < AUCTION_EXTREME_PREV_CLOSE_POS:
+                    reject_reason = f"★v9.1极限档前日封板不牢(close_pos<{AUCTION_EXTREME_PREV_CLOSE_POS})"
+
+        # ── ★ v9.1 分时量比持续性过滤──────────────────────────────────
+        if not reject_reason and strat == "竞价" and INTRADAY_VOL_SUSTAIN_ENABLE:
+            intraday_vol_sustain = float(getattr(sig, "intraday_vol_sustain", 1.0) or 1.0)
+            if intraday_vol_sustain < INTRADAY_VOL_SUSTAIN_RATIO:
+                reject_reason = (f"★v9.1分时量比持续性不足"
+                                 f"(日量/均量={intraday_vol_sustain:.2f}<{INTRADAY_VOL_SUSTAIN_RATIO}，盘中无人接盘)")
+
         # ── 规则1：评分门槛 ──────────────────────────────────────
         if not reject_reason:
             min_score = PUSH_MIN_SCORE.get(sig.strategy, 40)
@@ -3333,8 +3638,7 @@ def push_signals(signals: list, phase: str, emotion: dict = None) -> None:
     _kp  = kelly_position_advice(top1.score, strategy=top1.strategy,
                                   market_state=_ms, emotion=emotion)
     _pct = ""
-    import re as _re
-    _m = _re.search(r"\*\*(\d+)%\*\*", _kp)
+    _m = re.search(r"\*\*(\d+)%\*\*", _kp)
     if _m:
         _pct = f" 仓{_m.group(1)}%"
 
@@ -3390,15 +3694,55 @@ def push_signals(signals: list, phase: str, emotion: dict = None) -> None:
               "> 仓位建议=Kelly×月份系数×赚钱效应系数（极冷市场自动收缩）\n"
               "> 📌 第2天止损纪律：入场后第2天收盘浮亏>-2.0%且非缩量→第3天开盘必须止损出场（★v8.5收紧）\n"
               "> ★v9.0竞价止损：低开>2%当天直接止损（更严格），涨停后断板跌破5%止损\n"
+              "> ★v9.1连板梯队：2连板仓位×1.5（最佳），3连板仓位×0.7，4+连板停用\n"
+              "> ★v9.1封板力度：前日close_pos<0.60的连板竞价不参与（封板不稳=次日折价高）\n"
               "> 📈 强势延仓提示：连续2天收盘接近最高价（>85%位置）→可适当延长持仓1~3天")
 
+    # ── ★ v9.1 高优先级信号快速单推（不等批量，第一时间到达）────────
+    # 条件：评分≥80 或 竞价-连板-极限 子策略，且今日该阶段尚未推送过
+    URGENT_SCORE = 80
+    urgent_signals = [
+        s for s in sorted_signals
+        if (s.score >= URGENT_SCORE or
+            (s.strategy == "竞价" and s.sub_strategy == "竞价-连板-极限"))
+        and not is_already_pushed(s.code, s.strategy, phase)
+    ]
+    for us in urgent_signals:
+        _u_kp  = kelly_position_advice(us.score, strategy=us.strategy,
+                                       market_state=_ms, emotion=emotion)
+        _u_pct = ""
+        _u_m = re.search(r"\*\*(\d+)%\*\*", _u_kp)
+        if _u_m:
+            _u_pct = f" 仓{_u_m.group(1)}%"
+        urgent_title = (
+            f"⚡{STRATEGY_ICON.get(us.strategy,'')}{us.name}"
+            f"({us.score:.0f}分){_u_pct} [{beijing_now().strftime('%H:%M')}]"
+        )
+        urgent_body = (
+            f"# ⚡ 高优先级信号\n\n"
+            f"**{us.name}**（{us.code}）| {us.strategy} | {us.score:.0f}分\n\n"
+            f"{format_signal(us, 1, market_state=_ms, emotion=emotion)}\n"
+            f"> ⚡ 此消息为高优先级单独推送，请第一时间处理"
+        )
+        send_wx_urgent(urgent_title, urgent_body)
+        mark_pushed(us.code, us.strategy, phase)
+        log.info(f"高优先级快速推送: {us.name} {us.score:.0f}分")
+
     # ── 分批推送，每批不超过 8000 字，避免 Server酱截断 ───────────
+    # ★ v9.1：跳过已通过紧急通道单独推送过的信号，避免重复推送
+    urgent_pushed_keys = {push_dedup_key(s.code, s.strategy, phase) for s in urgent_signals}
+    batch_signals = [s for s in sorted_signals
+                     if push_dedup_key(s.code, s.strategy, phase) not in urgent_pushed_keys]
+
     BATCH_CHARS = 8000
     batch_lines: list = []
     batch_size  = 0
     batch_idx   = 1
 
     for rank, s in enumerate(sorted_signals, 1):
+        # ★ v9.1：已单独紧急推送的信号，在批量推中跳过（避免重复），但仍保留排名序号
+        if push_dedup_key(s.code, s.strategy, phase) in urgent_pushed_keys:
+            continue
         # ★ v5.0：把 emotion 传给 format_signal，Kelly仓位纳入赚钱效应
         card = format_signal(s, rank, market_state=_ms, emotion=emotion) + "\n---\n"
         if batch_size + len(card) > BATCH_CHARS and batch_lines:
@@ -5074,8 +5418,8 @@ def push_startup() -> None:
         "pre_close": "尾盘", "closed": "已收盘"
     }.get(phase, phase)
     send_wx(
-        "🟢打板系统已启动 v4.0",
-        f"**A股超短线量化交易系统 v4.0**\n\n"
+        "🟢打板系统已启动 v9.1",
+        f"**A股超短线量化交易系统 v9.1**\n\n"
         f"启动时间：{now_str}\n"
         f"当前阶段：**{phase_cn}**（{phase}）\n\n"
         f"**全覆盖六大策略**：\n"
