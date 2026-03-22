@@ -62,6 +62,7 @@ jobs:
       - name: 运行打板选股（全天循环）
         env:
           SENDKEY: ${{ secrets.SENDKEY }}
+          SENDKEY2: ${{ secrets.SENDKEY2 }}
           TEST_MODE: ${{ github.event.inputs.test_mode || '0' }}
           MANUAL_TRIGGER: ${{ github.event.inputs.manual_trigger || '0' }}
         # timeout 23400秒 = 390分钟，双重保险防止死循环
