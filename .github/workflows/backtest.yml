@@ -1,4 +1,4 @@
-name: 打板策略回测 v9.2
+name: 打板策略回测 v9.3
 
 on:
   workflow_dispatch:
@@ -16,13 +16,13 @@ on:
         required: false
         default: ""
       strategy:
-        description: "策略（竞价/反包，逗号分隔，v9.2修复gap_abort+弱势月+强势档量比）"
+        description: "策略（竞价/反包，逗号分隔，v9.3回滚量比+根治gap_abort+1月仓位0.3）"
         required: false
         default: ""
       max_stocks:
         description: "最多回测股票数（0=全量，建议先用 200 测试）"
         required: false
-        default: "200"
+        default: "0"
       factor_analysis:
         description: "是否输出多因子分析报告（true/false）"
         required: false
@@ -33,7 +33,7 @@ env:
 
 jobs:
   backtest:
-    name: 打板策略回测 v9.2
+    name: 打板策略回测 v9.3
     runs-on: ubuntu-latest
     timeout-minutes: 180
 
