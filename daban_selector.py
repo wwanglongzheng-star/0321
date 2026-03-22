@@ -563,7 +563,7 @@ def current_phase() -> str:
 
 
 # ================================================================
-# 微信推送（Server酱 v9.1 增强版）
+# 微信推送（Server酱 v9.5 增强版）
 # ================================================================
 
 # ── 推送去重集合：防止同一股票同一信号在同一阶段重复推送 ──────────
@@ -602,7 +602,7 @@ def _sc_post(key: str, title: str, content: str, timeout: int = 8) -> bool:
 def send_wx(title: str, content: str, retry: int = 3, urgent: bool = False) -> bool:
     """
     推送到 Server酱，失败自动重试 retry 次。
-    ★ v9.1 升级：
+    ★ v9.5 升级：
       - 双 SENDKEY 支持（主 key 失败自动切换备用 SENDKEY2）
       - urgent=True 超时缩短至 5s，失败等待 1s，主 key 失败立即切备用（无等待）
       - 普通模式：第1次失败等 2s，第2次等 4s（快速退避）
@@ -635,7 +635,7 @@ def send_wx(title: str, content: str, retry: int = 3, urgent: bool = False) -> b
 
 def send_wx_urgent(title: str, content: str) -> bool:
     """
-    ★ 高优先级信号快速推送通道（v9.1新增）：
+    ★ 高优先级信号快速推送通道（v9.5）：
       超时 5s、失败等 1s、主 key 失败立即切备用，重试 2 次。
     适用于：竞价-连板-极限 / 评分≥80 / 大盘崩溃预警 等时效性最强的信号。
     """
@@ -5444,7 +5444,7 @@ def push_startup() -> None:
     }.get(phase, phase)
     send_wx(
         "🟢打板系统已启动 v9.5",
-        f"**A股超短线量化交易系统 v9.1**\n\n"
+        f"**A股超短线量化交易系统 v9.5**\n\n"
         f"启动时间：{now_str}\n"
         f"当前阶段：**{phase_cn}**（{phase}）\n\n"
         f"**全覆盖六大策略**：\n"
