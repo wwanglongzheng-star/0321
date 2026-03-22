@@ -5443,7 +5443,7 @@ def push_startup() -> None:
         "pre_close": "尾盘", "closed": "已收盘"
     }.get(phase, phase)
     send_wx(
-        "🟢打板系统已启动 v9.1",
+        "🟢打板系统已启动 v9.5",
         f"**A股超短线量化交易系统 v9.1**\n\n"
         f"启动时间：{now_str}\n"
         f"当前阶段：**{phase_cn}**（{phase}）\n\n"
