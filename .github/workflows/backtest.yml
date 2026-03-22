@@ -1,4 +1,4 @@
-name: 打板策略回测 v8.0
+name: 打板策略回测 v8.2
 
 on:
   workflow_dispatch:
@@ -16,7 +16,7 @@ on:
         required: false
         default: ""
       strategy:
-        description: "策略（首板/竞价/反包/回调缩量，逗号分隔，留空=全部）"
+        description: "策略（首板/竞价/反包/回调缩量/洗盘抄底/日内抄底，逗号分隔，留空=全部）"
         required: false
         default: ""
       max_stocks:
@@ -33,7 +33,7 @@ env:
 
 jobs:
   backtest:
-    name: 打板策略回测 v8.0
+    name: 打板策略回测 v8.2
     runs-on: ubuntu-latest
     timeout-minutes: 180
 
