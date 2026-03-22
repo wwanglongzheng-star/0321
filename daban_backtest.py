@@ -1,5 +1,5 @@
 """
-打板策略 · 历史回测框架（v8.1 TradingAgents增强版）
+打板策略 · 历史回测框架（v8.0 策略扩展+评分优化版）
 ================================================
 策略说明：
   1. 首板策略  —— 当日出现首次涨停，次日竞价买入（假设涨停价附近成交）
@@ -52,23 +52,6 @@ v6.0 智能决策增强说明（本次升级，让盘中决策更正确更灵活
   ★ 跌停反包质量过滤升级：区分"恐慌性单次跌停"与"基本面持续下跌"：
                连续跌停>1次不做（利空持续），跌停前5日跌幅>15%不做（已在下行通道），
                开盘修复门槛从3%提高至4%（更严格的情绪确认）。
-
-v8.1 TradingAgents-CN增强版说明（参考 hsliuping/TradingAgents-CN 有价值模块）：
-  ★ 文件缓存层（DataCache）：历史数据本地缓存，重复回测不重复拉取，速度提升3~5x
-               参考：TradingAgents-CN 多级缓存架构（文件缓存 → MongoDB → Redis）
-               本系统轻量化实现：pickle序列化，按股票代码+日期范围hash命名，默认缓存7天
-  ★ 真实盘中量比接口：新增 fetch_realtime_vol_ratio() 使用 ak.stock_zh_a_spot_em()
-               替代日线5日均量近似值（当日量/均量），仅实盘使用，回测仍用日线近似
-               参考：TradingAgents-CN AKShare Provider get_batch_stock_quotes()
-  ★ 财务质量过滤（ENABLE_FINANCIAL_FILTER）：接入 akshare 财务数据
-               过滤PE<0（亏损）、PE>200（泡沫）、ROE<5%（盈利能力弱）的标的
-               参考：TradingAgents-CN provider.get_financial_data(symbol)
-               缓存财务数据（缓存7天），不影响回测速度
-  ★ 新闻情绪因子（score_news，满分10分）：接入 ak.stock_news_em() 获取股票新闻
-               近N条新闻标题中含正面关键词加分，含负面关键词扣分
-               作为 signal_score 第6维度，总分扩展至110分（原100分）
-               回测中默认关闭（ENABLE_NEWS_SCORE=False），实盘按需开启
-               参考：TradingAgents-CN 智能新闻分析多层次过滤+质量评估模块
 
 v8.0 策略扩展+评分优化说明（本次升级，引入外部高星仓库策略思路）：
   ★ 新增策略5：涨停回调缩量再启动策略（参考 wxhui1024/Quantitative-Trading-System）
@@ -425,52 +408,6 @@ ZT_PULLBACK_MKT_MAX       = 500   # 亿，流通市值上限500亿
 SIGNAL_SCORE_MIN_PULLBACK = 55.0
 
 
-
-
-# ================================================================
-# ★ v8.1 TradingAgents-CN 增强参数
-# ================================================================
-
-# ── 文件缓存层（参考TradingAgents-CN多级缓存架构）──────────────────────────
-# 目的：历史数据本地缓存，重复回测不重复拉取API，速度提升3~5x
-ENABLE_DATA_CACHE      = True            # 是否启用文件缓存
-DATA_CACHE_DIR         = ".daban_cache"  # 缓存目录（项目根目录下）
-DATA_CACHE_EXPIRE_DAYS = 7               # 缓存过期天数（7天内认为数据有效）
-
-# ── 财务质量过滤（参考TradingAgents-CN provider.get_financial_data）────────
-# 目的：剔除PE<0亏损股、PE>200泡沫股、ROE<5%盈利能力弱的垃圾标的
-# 注意：财务数据拉取较慢，已内置缓存，不影响整体回测速度
-ENABLE_FINANCIAL_FILTER  = False          # 默认关闭（财务数据拉取需网络，按需开启）
-FINANCIAL_PE_MIN         = 0.0           # PE最低值（<0=亏损，不做）
-FINANCIAL_PE_MAX         = 200.0         # PE最高值（>200=严重泡沫，风险极高）
-FINANCIAL_ROE_MIN        = 5.0           # ROE下限（%），低于5%盈利能力太弱
-FINANCIAL_CACHE_DAYS     = 7             # 财务数据缓存天数
-
-# ── 新闻情绪因子（参考TradingAgents-CN智能新闻分析模块）──────────────────
-# 目的：近N条股票新闻标题情绪作为signal_score第6维度，辅助判断舆情热度
-# 实现：ak.stock_news_em() 获取新闻，关键词匹配正负面评分
-# 注意：回测中拉取新闻极耗时，强烈建议仅实盘选股时开启
-ENABLE_NEWS_SCORE        = False          # 默认关闭（回测用，实盘selector按需开启）
-NEWS_LOOKBACK_COUNT      = 10            # 分析最近N条新闻
-NEWS_SCORE_MAX           = 10.0          # 新闻情绪满分（signal_score总分扩展至110）
-# 正面关键词（含此词加分）：业绩预增/重组/回购/中标/获奖等利好
-NEWS_POSITIVE_KEYWORDS   = [
-    "业绩预增", "净利润增长", "超预期", "重大合同", "中标", "回购", "增持",
-    "战略合作", "获批", "突破", "创新高", "订单", "扩产", "新能源", "AI",
-]
-# 负面关键词（含此词扣分）：亏损/诉讼/质押/减持等利空
-NEWS_NEGATIVE_KEYWORDS   = [
-    "亏损", "业绩下滑", "减持", "股权质押", "诉讼", "处罚", "立案", "违规",
-    "退市", "债务", "爆雷", "暴雷", "负面", "监管", "问询函",
-]
-
-# ── 真实盘中量比接口（参考TradingAgents-CN get_batch_stock_quotes）────────
-# 目的：实盘时使用真实量比替代回测中的日线近似量比
-# 接口：ak.stock_zh_a_spot_em() 实时行情（含volume_ratio字段）
-# 仅在实盘选股器中调用，回测仍用日线5日均量近似
-REALTIME_VOL_RATIO_ENABLE = False         # 回测默认关闭（实盘selector中开启）
-
-
 # ================================================================
 # 交易记录
 # ================================================================
@@ -500,289 +437,6 @@ class Trade:
     # ★ v6.0 智能化字段
     signal_score:  float = 0.0   # 情绪综合评分（0~100分），越高信号质量越好
     dynamic_hold:  int   = 0     # 实际使用的动态持仓天数上限
-
-
-
-
-# ================================================================
-# ★ v8.1 数据缓存层（TradingAgents-CN DataCache模式）
-# ================================================================
-import hashlib
-import pickle
-
-class DataCache:
-    """
-    文件级数据缓存，参考 TradingAgents-CN 多级缓存架构轻量化实现。
-    用于缓存历史日线数据和财务数据，避免回测时重复拉取API。
-    缓存文件：.daban_cache/{md5(key)}.pkl
-    过期逻辑：文件修改时间超过 expire_days 则视为过期
-    """
-    def __init__(self, cache_dir: str = DATA_CACHE_DIR,
-                 expire_days: float = DATA_CACHE_EXPIRE_DAYS):
-        self.cache_dir   = cache_dir
-        self.expire_secs = expire_days * 86400
-        if ENABLE_DATA_CACHE:
-            os.makedirs(self.cache_dir, exist_ok=True)
-
-    def _key_path(self, key: str) -> str:
-        h = hashlib.md5(key.encode("utf-8")).hexdigest()
-        return os.path.join(self.cache_dir, f"{h}.pkl")
-
-    def _is_expired(self, path: str) -> bool:
-        import time
-        if not os.path.exists(path):
-            return True
-        return (time.time() - os.path.getmtime(path)) > self.expire_secs
-
-    def load(self, key: str):
-        if not ENABLE_DATA_CACHE:
-            return None
-        path = self._key_path(key)
-        if self._is_expired(path):
-            return None
-        try:
-            with open(path, "rb") as f:
-                return pickle.load(f)
-        except Exception:
-            return None
-
-    def save(self, key: str, data) -> None:
-        if not ENABLE_DATA_CACHE:
-            return
-        path = self._key_path(key)
-        try:
-            with open(path, "wb") as f:
-                pickle.dump(data, f)
-        except Exception as e:
-            log.debug(f"缓存写入失败: {e}")
-
-    def get(self, key: str, fetch_func, *args, **kwargs):
-        """先读缓存，缓存失效则调用 fetch_func 并缓存结果"""
-        cached = self.load(key)
-        if cached is not None:
-            return cached
-        data = fetch_func(*args, **kwargs)
-        if data is not None:
-            self.save(key, data)
-        return data
-
-
-# 全局缓存实例
-_data_cache = DataCache()
-
-
-# ================================================================
-# ★ v8.1 财务质量过滤（TradingAgents-CN get_financial_data模式）
-# ================================================================
-_financial_cache: dict = {}   # 内存缓存：{code: {pe, roe, valid}}
-
-def fetch_financial_quality(code: str) -> dict:
-    """
-    获取股票财务质量指标（PE、ROE）。
-    数据源：akshare ak.stock_a_lg_indicator（个股A股指标）
-    返回：{"pe": float, "roe": float, "valid": bool}
-    带文件缓存（FINANCIAL_CACHE_DAYS天），失效才重新拉取。
-    """
-    global _financial_cache
-    if code in _financial_cache:
-        return _financial_cache[code]
-
-    default = {"pe": 20.0, "roe": 10.0, "valid": False}  # 无数据时不过滤
-
-    if not ENABLE_FINANCIAL_FILTER or not USE_AK:
-        _financial_cache[code] = default
-        return default
-
-    cache_key = f"financial_{code}"
-    cached = _data_cache.load(cache_key)
-    if cached is not None:
-        _financial_cache[code] = cached
-        return cached
-
-    try:
-        num = code[:6]
-        # akshare 个股估值指标接口（PE/PB/ROE等）
-        # 接口：ak.stock_a_indicator_lg(stock=num) 或 ak.stock_financial_analysis_indicator
-        # 兼容处理：先尝试 stock_a_indicator_lg，失败则尝试 stock_financial_analysis_indicator
-        df_fin = None
-        for func_name in ["stock_a_indicator_lg", "stock_financial_analysis_indicator"]:
-            func = getattr(ak, func_name, None)
-            if func is None:
-                continue
-            try:
-                df_fin = func(stock=num)
-                if df_fin is not None and not df_fin.empty:
-                    break
-            except Exception:
-                continue
-
-        if df_fin is None or df_fin.empty:
-            _financial_cache[code] = default
-            return default
-        # 取最新一条
-        latest = df_fin.iloc[-1]
-        # 尝试多种字段名（不同接口字段名不同）
-        pe_val = None
-        for pe_col in ["pe", "市盈率", "PE", "pe_ttm", "市盈率(TTM)"]:
-            if pe_col in latest.index:
-                pe_val = latest[pe_col]
-                break
-        pe = float(pe_val or 20.0)
-        roe_val = None
-        for roe_col in ["roe", "ROE", "净资产收益率", "roe_weighted"]:
-            if roe_col in latest.index:
-                roe_val = latest[roe_col]
-                break
-        roe = float(roe_val or 10.0)
-        result = {"pe": pe, "roe": roe, "valid": True}
-        _data_cache.save(cache_key, result)
-        _financial_cache[code] = result
-        return result
-    except Exception as e:
-        log.debug(f"{code} 财务数据拉取失败: {e}")
-        _financial_cache[code] = default
-        return default
-
-
-def check_financial_quality(code: str) -> bool:
-    """
-    财务质量硬过滤：
-      - PE < FINANCIAL_PE_MIN（亏损股，<0）→ 过滤
-      - PE > FINANCIAL_PE_MAX（严重泡沫，>200）→ 过滤
-      - ROE < FINANCIAL_ROE_MIN（盈利能力弱，<5%）→ 过滤
-    返回 True=通过，False=过滤掉
-    """
-    if not ENABLE_FINANCIAL_FILTER:
-        return True
-    fin = fetch_financial_quality(code)
-    if not fin.get("valid", False):
-        return True   # 拉取失败时不过滤，避免误杀
-    pe  = fin["pe"]
-    roe = fin["roe"]
-    if pe < FINANCIAL_PE_MIN or pe > FINANCIAL_PE_MAX:
-        return False
-    if roe < FINANCIAL_ROE_MIN:
-        return False
-    return True
-
-
-# ================================================================
-# ★ v8.1 新闻情绪因子（TradingAgents-CN 新闻分析模块）
-# ================================================================
-_news_cache: dict = {}   # 内存缓存：{code: score}
-
-def fetch_news_sentiment_score(code: str) -> float:
-    """
-    获取股票最近NEWS_LOOKBACK_COUNT条新闻的情绪评分（0~NEWS_SCORE_MAX）。
-    数据源：akshare ak.stock_news_em(symbol=code[:6])
-    正面关键词：加分；负面关键词：扣分；无新闻：返回中性分（5分）
-    带文件缓存（当天有效，次日回测自动更新）。
-    注意：仅实盘/选股时调用，回测默认 ENABLE_NEWS_SCORE=False 跳过。
-    """
-    if not ENABLE_NEWS_SCORE or not USE_AK:
-        return 5.0   # 中性分，不影响评分系统
-
-    global _news_cache
-    if code in _news_cache:
-        return _news_cache[code]
-
-    cache_key = f"news_{code}_{datetime.date.today().strftime('%Y%m%d')}"
-    cached = _data_cache.load(cache_key)
-    if cached is not None:
-        _news_cache[code] = cached
-        return cached
-
-    try:
-        num = code[:6]
-        df_news = ak.stock_news_em(symbol=num)
-        if df_news is None or df_news.empty:
-            _news_cache[code] = 5.0
-            return 5.0
-
-        # 取最近N条标题
-        titles = df_news["新闻标题"].iloc[:NEWS_LOOKBACK_COUNT].tolist()
-        pos_cnt = 0
-        neg_cnt = 0
-        for title in titles:
-            title_str = str(title)
-            for kw in NEWS_POSITIVE_KEYWORDS:
-                if kw in title_str:
-                    pos_cnt += 1
-                    break
-            for kw in NEWS_NEGATIVE_KEYWORDS:
-                if kw in title_str:
-                    neg_cnt += 1
-                    break
-
-        # 情绪分：正面比例 × 满分，负面比例扣分
-        total = len(titles) or 1
-        raw_score = (pos_cnt / total * NEWS_SCORE_MAX) - (neg_cnt / total * NEWS_SCORE_MAX * 0.5)
-        score = max(0.0, min(NEWS_SCORE_MAX, raw_score + NEWS_SCORE_MAX * 0.5))  # 中性基准5分
-
-        _data_cache.save(cache_key, score)
-        _news_cache[code] = score
-        return score
-    except Exception as e:
-        log.debug(f"{code} 新闻情绪拉取失败: {e}")
-        _news_cache[code] = 5.0
-        return 5.0
-
-
-# ================================================================
-# ★ v8.1 真实盘中量比（TradingAgents-CN get_batch_stock_quotes模式）
-# ================================================================
-_realtime_vol_ratio_cache: dict = {}   # 内存缓存（当日有效）
-_realtime_cache_date: str = ""
-
-def fetch_realtime_vol_ratio_batch(codes: list) -> dict:
-    """
-    批量获取全市场真实盘中量比，替代日线5日均量近似值。
-    数据源：ak.stock_zh_a_spot_em()，字段：量比
-    返回：{code_6位: vol_ratio}
-    参考：TradingAgents-CN AKShare Provider get_batch_stock_quotes()
-    注意：仅实盘使用，回测不调用（REALTIME_VOL_RATIO_ENABLE=False）
-    """
-    global _realtime_vol_ratio_cache, _realtime_cache_date
-
-    if not REALTIME_VOL_RATIO_ENABLE or not USE_AK:
-        return {}
-
-    today = datetime.date.today().strftime("%Y-%m-%d")
-    if _realtime_cache_date == today and _realtime_vol_ratio_cache:
-        return _realtime_vol_ratio_cache
-
-    try:
-        df_spot = ak.stock_zh_a_spot_em()
-        if df_spot is None or df_spot.empty:
-            return {}
-        # 字段名：代码、名称、量比 等
-        # akshare stock_zh_a_spot_em 实际字段：序号,代码,名称,最新价,...,量比,...
-        col_map = {}
-        for col in df_spot.columns:
-            if "量比" in str(col):
-                col_map["量比"] = col
-            if "代码" in str(col):
-                col_map["代码"] = col
-        if "代码" not in col_map or "量比" not in col_map:
-            log.warning("ak.stock_zh_a_spot_em 字段名异常，实时量比获取失败")
-            return {}
-
-        result = {}
-        for _, row in df_spot.iterrows():
-            code_6 = str(row[col_map["代码"]]).zfill(6)
-            vr = row[col_map["量比"]]
-            try:
-                result[code_6] = float(vr)
-            except (ValueError, TypeError):
-                result[code_6] = 1.0
-
-        _realtime_vol_ratio_cache = result
-        _realtime_cache_date = today
-        log.info(f"实时量比已更新：{len(result)} 只股票")
-        return result
-    except Exception as e:
-        log.warning(f"实时量比拉取失败: {e}")
-        return {}
 
 
 # ================================================================
@@ -822,13 +476,7 @@ def _fetch_history_bs(code: str, start: str, end: str) -> Optional[pd.DataFrame]
 def fetch_history(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
     """拉取日线数据，统一列名：date / 开盘 / 最高 / 最低 / 收盘 / 成交量 / 成交额
     优先 baostock（海外IP友好），失败则回退 akshare
-    ★ v8.1：增加文件缓存层，避免重复拉取API（TradingAgents-CN DataCache模式）
     """
-    # ★ v8.1 先查文件缓存
-    cache_key = f"hist_{code}_{start}_{end}"
-    cached_df = _data_cache.load(cache_key)
-    if cached_df is not None:
-        return cached_df
     try:
         df = None
         # ── 优先 baostock ─────────────────────────────────────────
@@ -1035,7 +683,7 @@ def fetch_history(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
         # 因子5：ATR波动奖励（适度波动最优，太小无弹性，太大风险高，满分10分）
         atr_pct   = (-df["atr_stop_pct"]).clip(0.02, 0.08)  # 转正值
         score_atr = ((atr_pct - 0.02) / 0.06 * 10).fillna(5.0)
-        # 汇总评分（★v8.1 新闻情绪因子通过backtest层传入，此处不拉取避免影响速度）
+        # 汇总评分
         df["signal_score"] = (
             score_seal + score_volratio + score_mom + score_vol + score_atr
         ).clip(0, 100)
@@ -1081,9 +729,6 @@ def fetch_history(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
             np.arange(len(df)) - df["last_zt_idx"],
             -1
         )
-
-        # ★ v8.1 写入文件缓存（TradingAgents-CN DataCache模式）
-        _data_cache.save(cache_key, df)
 
         return df
     except Exception as e:
@@ -1463,16 +1108,9 @@ def backtest_first_board(code: str, df: pd.DataFrame) -> list:
                 if bool(row.get("vol_price_diverge", False)):
                     continue
 
-            # ── ★ v8.1 财务质量过滤（TradingAgents-CN财务数据模式）──
-            if ENABLE_FINANCIAL_FILTER and not check_financial_quality(code):
-                break   # 同一只股票财务不过关，跳过全部信号
-
             # ── ★ v6.0 情绪综合评分过滤（只做高质量信号）──────────
             score = float(row.get("signal_score", 50.0) or 50.0)
-            # ★ v8.1 叠加新闻情绪分（仅实盘/ENABLE_NEWS_SCORE=True时有效）
-            news_score = fetch_news_sentiment_score(code)
-            score_with_news = min(score + news_score, 110.0)   # 总分上限110
-            if SIGNAL_SCORE_ENABLE and score_with_news < SIGNAL_SCORE_MIN_FIRST:
+            if SIGNAL_SCORE_ENABLE and score < SIGNAL_SCORE_MIN_FIRST:
                 continue  # 评分不达标，信号质量不够，跳过
 
         if i + 1 >= n:
@@ -1498,13 +1136,10 @@ def backtest_first_board(code: str, df: pd.DataFrame) -> list:
 
         # ── ★ v6.0 动态持仓天数：按信号评分自动调整 ─────────────
         score = float(row.get("signal_score", 50.0) or 50.0)
-        # ★ v8.1 动态持仓也用含新闻情绪的合成分
-        news_score_dyn = fetch_news_sentiment_score(code) if ENABLE_NEWS_SCORE else 0.0
-        score_final = min(score + news_score_dyn, 110.0)
         if DYNAMIC_HOLD_ENABLE:
-            if score_final >= DYNAMIC_HOLD_HIGH_THRESH:
+            if score >= DYNAMIC_HOLD_HIGH_THRESH:
                 _dyn_hold = HOLD_DAYS_STRONG   # 强势信号延长持仓
-            elif score_final <= DYNAMIC_HOLD_LOW_THRESH:
+            elif score <= DYNAMIC_HOLD_LOW_THRESH:
                 _dyn_hold = HOLD_DAYS_WEAK     # 弱势信号缩短持仓
             else:
                 _dyn_hold = HOLD_DAYS          # 中间段保持默认
@@ -1530,7 +1165,7 @@ def backtest_first_board(code: str, df: pd.DataFrame) -> list:
             is_yizi=is_yizi,
             avg_amplitude=round(avg_amp, 2),
             avg_amount_m=round(avg_amt_m, 1),
-            signal_score=round(score_final, 1),   # ★v8.1 含新闻情绪的合成分
+            signal_score=round(score, 1),
             dynamic_hold=_dyn_hold,
         ))
 
@@ -2545,18 +2180,6 @@ def print_report(stats: dict, trades: list) -> None:
           f"评分≥{SIGNAL_SCORE_MIN_PULLBACK:.0f}")
     print(f"  评分Z-score标准化 : ✅开启  量比/动量/放量因子均Z-score标准化（消除量纲偏差）")
     print(f"  弱势月份v8.0扩展  : ✅开启  {_weak_months_str}（新增7/8月，胜率<36%）")
-
-    # ★ v8.1：TradingAgents-CN增强模块状态
-    print(f"\n  ── v8.1 TradingAgents-CN增强模块状态 ──")
-    print(f"  文件缓存层        : {'✅开启' if ENABLE_DATA_CACHE else '❌关闭'}"
-          f"  缓存目录={DATA_CACHE_DIR} 过期={DATA_CACHE_EXPIRE_DAYS}天")
-    print(f"  财务质量过滤      : {'✅开启' if ENABLE_FINANCIAL_FILTER else '❌关闭(按需开启)'}"
-          f"  PE[{FINANCIAL_PE_MIN:.0f}~{FINANCIAL_PE_MAX:.0f}] ROE≥{FINANCIAL_ROE_MIN:.0f}%")
-    print(f"  新闻情绪因子      : {'✅开启' if ENABLE_NEWS_SCORE else '❌关闭(实盘按需开启)'}"
-          f"  近{NEWS_LOOKBACK_COUNT}条新闻 满分{NEWS_SCORE_MAX:.0f}分 总分上限110")
-    print(f"  实时盘中量比      : {'✅开启' if REALTIME_VOL_RATIO_ENABLE else '❌关闭(实盘按需开启)'}"
-          f"  接口=ak.stock_zh_a_spot_em()")
-
 
     # ★ v4.0：按年度统计
     yearly = stats.get("yearly_stats", {})
