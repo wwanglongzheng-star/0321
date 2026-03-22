@@ -1,4 +1,4 @@
-name: 打板策略回测 v8.2
+name: 打板策略回测 v8.4
 
 on:
   workflow_dispatch:
@@ -33,7 +33,7 @@ env:
 
 jobs:
   backtest:
-    name: 打板策略回测 v8.2
+    name: 打板策略回测 v8.4
     runs-on: ubuntu-latest
     timeout-minutes: 180
 
