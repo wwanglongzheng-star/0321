@@ -713,15 +713,67 @@ def get_yesterday_dt() -> pd.DataFrame:
         log.warning(f"⚠️ 昨日跌停池所有日期请求均失败: {last_error}")
     return pd.DataFrame()
 
+def _em_make_session(headers: dict) -> requests.Session:
+    """创建独立 Session，配置连接池大小与重试适配器，避免多线程共享连接池溢出。"""
+    from requests.adapters import HTTPAdapter
+    sess = requests.Session()
+    sess.headers.update(headers)
+    # pool_connections/pool_maxsize 与并发线程数匹配，避免 "Connection pool is full" 警告
+    adapter = HTTPAdapter(pool_connections=2, pool_maxsize=2, max_retries=0)
+    sess.mount("http://", adapter)
+    sess.mount("https://", adapter)
+    return sess
+
+
+def _em_fetch_page_isolated(url: str, params: dict, headers: dict, pn: int, retry: int = 1) -> list:
+    """
+    每次调用独立创建 Session（不共享），用完即关，彻底消除连接池竞争。
+    失败后自动重试 retry 次（间隔 0.5s）。
+    """
+    import time as _t
+    last_exc = None
+    for attempt in range(retry + 1):
+        sess = _em_make_session(headers)
+        try:
+            r = sess.get(url, params=dict(params, pn=str(pn)), timeout=20)
+            r.raise_for_status()
+            j = r.json()
+            return j["data"]["diff"] if j.get("data") and j["data"].get("diff") else []
+        except Exception as e:
+            last_exc = e
+            if attempt < retry:
+                _t.sleep(0.5)
+        finally:
+            sess.close()
+    raise last_exc  # type: ignore[misc]
+
+
+def _em_build_df(all_rows: list) -> pd.DataFrame:
+    """将东方财富原始行列表转为标准化 DataFrame（两个节点共用）。"""
+    df = pd.DataFrame(all_rows)
+    df = df.rename(columns={
+        "f12": "code",    "f14": "name",       "f2": "price",
+        "f3":  "chg_pct", "f6":  "amount",      "f20": "circ_mkt_cap",
+        "f8":  "turnover","f9":  "vol_ratio",   "f17": "open",
+        "f15": "high",    "f16": "low",         "f18": "prev_close",
+    })
+    keep = [c for c in ("code","name","price","chg_pct","amount","circ_mkt_cap",
+                         "turnover","vol_ratio","open","high","low","prev_close")
+            if c in df.columns]
+    df = df[keep].copy()
+    for col in ("price","chg_pct","amount","circ_mkt_cap","turnover","vol_ratio",
+                "open","high","low","prev_close"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+
 def _fetch_spot_em() -> pd.DataFrame:
     """
-    主接口：直接请求东方财富 push2 API，并发分页（20线程），绕过 akshare 串行分页限制。
-    akshare 的 stock_zh_a_spot_em() 内部串行请求 ~69 页，每页一次 HTTP，极易触发限流。
-    此实现改为并发 20 线程同时请求，耗时从 ~60s 降至 ~4s，且减少被限流概率。
+    主接口：东方财富 82 节点，并发 6 线程分页。
+    每线程独立 Session，不共享连接池，失败页自动重试1次。
+    并发数控制在 6 以内，避免触发服务端限流。
     """
-    from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
-    import time as _t
-
     _EM_URL = "https://82.push2.eastmoney.com/api/qt/clist/get"
     _EM_HEADERS = {
         "User-Agent": (
@@ -741,13 +793,15 @@ def _fetch_spot_em() -> pd.DataFrame:
     # f12=代码 f14=名称 f2=最新价 f3=涨跌幅 f6=成交额 f20=流通市值
     # f8=换手率 f9=量比  f17=今开  f15=最高  f16=最低  f18=昨收
 
-    sess = requests.Session()
-    sess.headers.update(_EM_HEADERS)
+    # 第一页：获取总记录数（独立 Session）
+    r0_sess = _em_make_session(_EM_HEADERS)
+    try:
+        r0 = r0_sess.get(_EM_URL, params=dict(_EM_PARAMS_BASE, pn="1"), timeout=20)
+        r0.raise_for_status()
+        j0 = r0.json()
+    finally:
+        r0_sess.close()
 
-    # 第一页：获取总记录数
-    r0 = sess.get(_EM_URL, params=dict(_EM_PARAMS_BASE, pn="1"), timeout=15)
-    r0.raise_for_status()
-    j0 = r0.json()
     if not j0.get("data") or not j0["data"].get("diff"):
         raise ValueError("东方财富 API 返回空数据")
     total = int(j0["data"]["total"])
@@ -755,16 +809,13 @@ def _fetch_spot_em() -> pd.DataFrame:
     pages = (total + pz - 1) // pz
     all_rows: list = list(j0["data"]["diff"])
 
-    def _fetch_page(pn: int) -> list:
-        r = sess.get(_EM_URL, params=dict(_EM_PARAMS_BASE, pn=str(pn)), timeout=15)
-        r.raise_for_status()
-        j = r.json()
-        return j["data"]["diff"] if j.get("data") and j["data"].get("diff") else []
-
     if pages > 1:
-        with ThreadPoolExecutor(max_workers=20) as pool:
-            futures = {pool.submit(_fetch_page, pn): pn for pn in range(2, pages + 1)}
-            for f in _as_completed(futures):
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            futures = {
+                pool.submit(_em_fetch_page_isolated, _EM_URL, _EM_PARAMS_BASE, _EM_HEADERS, pn, 1): pn
+                for pn in range(2, pages + 1)
+            }
+            for f in as_completed(futures):
                 try:
                     all_rows.extend(f.result())
                 except Exception as _e:
@@ -772,56 +823,61 @@ def _fetch_spot_em() -> pd.DataFrame:
 
     if not all_rows:
         raise ValueError("东方财富 API 所有分页均返回空数据")
-
-    df = pd.DataFrame(all_rows)
-    df = df.rename(columns={
-        "f12": "code",   "f14": "name",      "f2": "price",
-        "f3":  "chg_pct","f6":  "amount",     "f20": "circ_mkt_cap",
-        "f8":  "turnover","f9": "vol_ratio",  "f17": "open",
-        "f15": "high",   "f16": "low",        "f18": "prev_close",
-    })
-    # 保留需要的列，忽略多余列
-    keep = [c for c in ("code","name","price","chg_pct","amount","circ_mkt_cap",
-                         "turnover","vol_ratio","open","high","low","prev_close")
-            if c in df.columns]
-    df = df[keep].copy()
-    for col in ("price","chg_pct","amount","circ_mkt_cap","turnover","vol_ratio",
-                "open","high","low","prev_close"):
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-    return df
+    return _em_build_df(all_rows)
 
 
-def _fetch_spot_sina() -> pd.DataFrame:
+def _fetch_spot_em_backup() -> pd.DataFrame:
     """
-    备用接口：ak.stock_zh_a_spot()（新浪财经）
-    字段映射后返回与主接口相同的标准化列名 DataFrame，失败抛出异常。
+    备用接口：东方财富 17 节点，与主节点独立限流。
+    同样使用独立 Session + 并发 6 线程 + 失败自动重试1次。
     """
-    df = ak.stock_zh_a_spot()
-    if df is None or df.empty:
-        raise ValueError("stock_zh_a_spot 返回空数据")
-    # 新浪接口字段映射
-    col_map = {
-        "symbol": "code", "name": "name", "trade": "price",
-        "pricechange": "chg_pct", "turnoverratio": "turnover",
-        "open": "open", "high": "high", "low": "low",
-        "settlement": "prev_close", "volume": "volume", "amount": "amount",
+    _EM_URL = "https://17.push2.eastmoney.com/api/qt/clist/get"
+    _EM_HEADERS = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Referer": "https://quote.eastmoney.com/center/gridlist.html",
     }
-    df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
-    # 新浪 code 格式为 sh600000/sz000001，只保留6位数字
-    if "code" in df.columns:
-        df["code"] = df["code"].astype(str).str[-6:]
-    # 补齐缺失的字段（新浪没有量比/流通市值）
-    for col in ("vol_ratio", "circ_mkt_cap"):
-        if col not in df.columns:
-            df[col] = 0.0
-    # chg_pct：新浪是绝对涨跌额，需转换成百分比
-    if "chg_pct" in df.columns and "prev_close" in df.columns:
-        try:
-            pc = pd.to_numeric(df["prev_close"], errors="coerce").replace(0, float("nan"))
-            df["chg_pct"] = pd.to_numeric(df["chg_pct"], errors="coerce") / pc * 100
-        except Exception:
-            pass
+    _EM_PARAMS_BASE = {
+        "pz": "100", "po": "1", "np": "1",
+        "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+        "fltt": "2", "invt": "2", "fid": "f12",
+        "fs": "m:0 t:6,m:0 t:80,m:1 t:2,m:1 t:23,m:0 t:81 s:2048",
+        "fields": "f12,f14,f2,f3,f6,f20,f8,f9,f17,f15,f16,f18",
+    }
+
+    r0_sess = _em_make_session(_EM_HEADERS)
+    try:
+        r0 = r0_sess.get(_EM_URL, params=dict(_EM_PARAMS_BASE, pn="1"), timeout=20)
+        r0.raise_for_status()
+        j0 = r0.json()
+    finally:
+        r0_sess.close()
+
+    if not j0.get("data") or not j0["data"].get("diff"):
+        raise ValueError("东方财富备用节点返回空数据")
+    total = int(j0["data"]["total"])
+    pz    = int(_EM_PARAMS_BASE["pz"])
+    pages = (total + pz - 1) // pz
+    all_rows: list = list(j0["data"]["diff"])
+
+    if pages > 1:
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            futures = {
+                pool.submit(_em_fetch_page_isolated, _EM_URL, _EM_PARAMS_BASE, _EM_HEADERS, pn, 1): pn
+                for pn in range(2, pages + 1)
+            }
+            for f in as_completed(futures):
+                try:
+                    all_rows.extend(f.result())
+                except Exception as _e:
+                    log.warning(f"[行情] 东方财富备用节点第{futures[f]}页失败: {_e}")
+
+    if not all_rows:
+        raise ValueError("东方财富备用节点所有分页均返回空数据")
+    return _em_build_df(all_rows)
     return df
 
 
@@ -843,10 +899,10 @@ def get_realtime_quotes(codes: list = None) -> pd.DataFrame:
         if not _realtime_cache.empty and (now_ts - _realtime_cache_time) < REALTIME_CACHE_TTL:
             return _realtime_cache.copy()
 
-    # 依次尝试主接口、备用接口
+    # 依次尝试主接口、备用接口（均为东方财富不同节点，互相独立限流）
     fetchers = [
-        ("东方财富", _fetch_spot_em),
-        ("新浪财经", _fetch_spot_sina),
+        ("东方财富主节点(82)", _fetch_spot_em),
+        ("东方财富备用节点(17)", _fetch_spot_em_backup),
     ]
     last_error = None
     for source, fetcher in fetchers:
@@ -862,8 +918,7 @@ def get_realtime_quotes(codes: list = None) -> pd.DataFrame:
         except Exception as e:
             last_error = e
             log.warning(f"[行情] {source} 接口失败: {e}，尝试下一个接口...")
-            # 两个接口间稍作间隔，避免立即触发限流
-            _time.sleep(2)
+            _time.sleep(1)
 
     # 全部接口失败 → 降级使用缓存
     log.error(f"[行情] 所有接口均失败，最后错误: {last_error}")
