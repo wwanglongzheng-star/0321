@@ -523,6 +523,7 @@ _realtime_cache_time: float = 0.0
 REALTIME_CACHE_TTL: float = 55.0    # 行情缓存有效期55秒（略小于90秒扫描间隔）
 # ★ v3.7：腾讯行情接口全市场代码列表缓存（一次获取后长期复用，避免开盘封锁时反复请求）
 _TXZQ_CODES_CACHE: list = []         # 全市场股票代码列表缓存（6位字符串）
+_SINA_CODES_CACHE: list = []         # 新浪接口有效代码缓存（首次全量后只存真实上市股票，约5300只）
 # ★ v3.1：定时心跳推送（每小时推一次「系统在线+市场状态」，确认系统正常）
 _HEARTBEAT_PUSHED_HOURS: set = set() # 已推送心跳的小时集合（9,10,11,13,14）
 # ★ v4.0：尾盘套利每日只推一次标记
@@ -876,9 +877,13 @@ def _fetch_spot_sina() -> pd.DataFrame:
 
     特点：
     - 接口在境外（GitHub Actions）访问成功率远高于东方财富
-    - 每批最多 800 只股票，一次请求覆盖全市场约 5600 只 A 股（约 7 批）
     - 无需鉴权，无 Cookie/Token，反爬极宽松
     - 返回字段：现价/开/高/低/昨收/成交量/成交额，但无量比/流通市值
+
+    ★ v3.12 性能优化：
+    - 首次运行：用枚举代码表（约19600条）以 10 线程并发分批请求，约 12~18s 完成
+    - 首次完成后将有效代码（约5300只）写入 _SINA_CODES_CACHE
+    - 后续调用：直接用缓存代码（约5300只），7批串行，约 15~20s，速度提升 3x
 
     格式：var hq_str_sh600000="浦发银行,10.55,10.50,10.58,10.62,10.45,..."
     字段（逗号分割，0-based）：
@@ -887,6 +892,7 @@ def _fetch_spot_sina() -> pd.DataFrame:
     """
     import re as _re
     import time as _t
+    import threading as _threading
 
     _SINA_URL  = "https://hq.sinajs.cn/list={syms}"
     _SINA_HEADERS = {
@@ -896,83 +902,138 @@ def _fetch_spot_sina() -> pd.DataFrame:
     }
     _LINE_RE = _re.compile(r'hq_str_(?:sh|sz)(\d{6})="([^"]+)"')
 
-    # 使用与腾讯接口相同的离线代码表（已缓存，通常不需重新生成）
-    global _TXZQ_CODES_CACHE
-    all_codes: list = []
+    def _to_sina_sym(c: str) -> str:
+        return ("sh" if c.startswith(("6", "9")) else "sz") + c
+
+    def _parse_text(text: str) -> list:
+        rows = []
+        for m in _LINE_RE.finditer(text):
+            code = m.group(1).zfill(6)
+            fields = m.group(2).split(",")
+            if len(fields) < 10 or not fields[3]:
+                continue
+            try:
+                prev_c  = float(fields[2]) if fields[2] else float("nan")
+                price   = float(fields[3]) if fields[3] else float("nan")
+                open_p  = float(fields[1]) if fields[1] else float("nan")
+                high    = float(fields[4]) if fields[4] else float("nan")
+                low     = float(fields[5]) if fields[5] else float("nan")
+                amt     = float(fields[9]) if fields[9] else float("nan")
+                chg_pct = (price - prev_c) / prev_c * 100 if prev_c else float("nan")
+                name    = fields[0]
+            except (ValueError, IndexError):
+                continue
+            if price <= 0 or prev_c <= 0:
+                continue
+            rows.append({
+                "code":         code,
+                "name":         name,
+                "price":        price,
+                "prev_close":   prev_c,
+                "open":         open_p,
+                "high":         high,
+                "low":          low,
+                "amount":       amt,
+                "chg_pct":      chg_pct,
+                "turnover":     float("nan"),
+                "circ_mkt_cap": float("nan"),
+                "vol_ratio":    float("nan"),
+            })
+        return rows
+
+    _BATCH   = 800
+    _TIMEOUT = 10
+
+    global _SINA_CODES_CACHE, _TXZQ_CODES_CACHE
+
+    # ── 后续调用：有效代码缓存已建立，7批串行，约15~20s ──
+    if _SINA_CODES_CACHE:
+        all_codes = _SINA_CODES_CACHE
+        all_rows: list = []
+        consec_fail = 0
+        sess = _em_make_session(_SINA_HEADERS)
+        try:
+            for i in range(0, len(all_codes), _BATCH):
+                batch = all_codes[i: i + _BATCH]
+                syms  = ",".join(_to_sina_sym(c) for c in batch)
+                try:
+                    r = sess.get(_SINA_URL.format(syms=syms), timeout=_TIMEOUT)
+                    r.encoding = "gbk"
+                    all_rows.extend(_parse_text(r.text))
+                    consec_fail = 0
+                except Exception:
+                    consec_fail += 1
+                    if consec_fail >= 3:
+                        raise ValueError(f"新浪行情接口连续 {consec_fail} 批失败，判定网络不通")
+                    _t.sleep(0.2)
+                if i + _BATCH < len(all_codes):
+                    _t.sleep(0.05)
+        finally:
+            sess.close()
+
+        if not all_rows:
+            raise ValueError("新浪行情接口返回空数据（缓存模式）")
+
+        df = pd.DataFrame(all_rows)
+        for col in ("price","chg_pct","amount","circ_mkt_cap","turnover","vol_ratio",
+                    "open","high","low","prev_close"):
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        return df
+
+    # ── 首次调用：枚举代码，多线程并发加速（10并发），约12~18s ──
     if _TXZQ_CODES_CACHE:
         all_codes = _TXZQ_CODES_CACHE
     else:
         all_codes = _txzq_build_fallback_codes()
         _TXZQ_CODES_CACHE = all_codes
 
-    def _to_sina_sym(c: str) -> str:
-        return ("sh" if c.startswith(("6", "9")) else "sz") + c
+    batches = [all_codes[i: i + _BATCH] for i in range(0, len(all_codes), _BATCH)]
+    log.debug(f"[新浪行情] 首次全量枚举，共 {len(batches)} 批（{len(all_codes)} 个代码），10线程并发")
 
-    _BATCH    = 800     # 新浪单次最多 800 只
-    _TIMEOUT  = 10
-    _MAX_CONSEC_FAIL = 3   # 连续3批失败即放弃
+    results_lock   = _threading.Lock()
+    all_rows_conc: list = []
+    fail_count     = 0
+    _MAX_FAIL_CONC = max(5, len(batches) // 3)   # 容忍最多 1/3 批次失败
+    import concurrent.futures as _cf
 
-    all_rows  = []
-    consec_fail = 0
-    sess = _em_make_session(_SINA_HEADERS)
-    try:
-        for i in range(0, len(all_codes), _BATCH):
-            batch = all_codes[i: i + _BATCH]
-            syms  = ",".join(_to_sina_sym(c) for c in batch)
-            try:
-                r = sess.get(_SINA_URL.format(syms=syms), timeout=_TIMEOUT)
-                r.encoding = "gbk"
-                text = r.text
-                consec_fail = 0
-            except Exception:
-                consec_fail += 1
-                if consec_fail >= _MAX_CONSEC_FAIL:
-                    raise ValueError(f"新浪行情接口连续 {consec_fail} 批失败，判定网络不通")
-                _t.sleep(0.2)
-                continue
+    def _fetch_batch(batch_codes: list) -> list:
+        nonlocal fail_count
+        syms = ",".join(_to_sina_sym(c) for c in batch_codes)
+        try:
+            import requests as _req
+            r = _req.get(
+                _SINA_URL.format(syms=syms),
+                headers=_SINA_HEADERS,
+                timeout=_TIMEOUT,
+            )
+            r.encoding = "gbk"
+            return _parse_text(r.text)
+        except Exception:
+            with results_lock:
+                fail_count += 1
+            return []
 
-            for m in _LINE_RE.finditer(text):
-                code = m.group(1).zfill(6)
-                fields = m.group(2).split(",")
-                if len(fields) < 10 or not fields[3]:
-                    continue
-                try:
-                    prev_c = float(fields[2]) if fields[2] else float("nan")
-                    price  = float(fields[3]) if fields[3] else float("nan")
-                    open_p = float(fields[1]) if fields[1] else float("nan")
-                    high   = float(fields[4]) if fields[4] else float("nan")
-                    low    = float(fields[5]) if fields[5] else float("nan")
-                    vol    = float(fields[8]) if fields[8] else float("nan")   # 成交量(股)
-                    amt    = float(fields[9]) if fields[9] else float("nan")   # 成交额(元)
-                    chg_pct = (price - prev_c) / prev_c * 100 if prev_c else float("nan")
-                    name   = fields[0]
-                except (ValueError, IndexError):
-                    continue
-                if price <= 0 or prev_c <= 0:
-                    continue
-                all_rows.append({
-                    "code":         code,
-                    "name":         name,
-                    "price":        price,
-                    "prev_close":   prev_c,
-                    "open":         open_p,
-                    "high":         high,
-                    "low":          low,
-                    "amount":       amt,
-                    "chg_pct":      chg_pct,
-                    "turnover":     float("nan"),    # 新浪无换手率
-                    "circ_mkt_cap": float("nan"),    # 新浪无流通市值
-                    "vol_ratio":    float("nan"),    # 新浪无量比
-                })
-            if i + _BATCH < len(all_codes):
-                _t.sleep(0.1)
-    finally:
-        sess.close()
+    with _cf.ThreadPoolExecutor(max_workers=10) as executor:
+        futures = [executor.submit(_fetch_batch, b) for b in batches]
+        for fut in _cf.as_completed(futures):
+            rows = fut.result()
+            if rows:
+                with results_lock:
+                    all_rows_conc.extend(rows)
 
-    if not all_rows:
-        raise ValueError("新浪行情接口返回空数据")
+    if fail_count >= _MAX_FAIL_CONC and not all_rows_conc:
+        raise ValueError(f"新浪行情接口首次枚举失败批次过多（{fail_count}/{len(batches)}），判定网络不通")
 
-    df = pd.DataFrame(all_rows)
+    if not all_rows_conc:
+        raise ValueError("新浪行情接口首次枚举返回空数据")
+
+    # 将有效代码写入缓存（按原始号段顺序排列，去重）
+    valid_codes = list(dict.fromkeys(row["code"] for row in all_rows_conc))
+    _SINA_CODES_CACHE = valid_codes
+    log.info(f"[新浪行情] 首次枚举完成，有效代码 {len(valid_codes)} 只，已缓存（后续调用将快速完成）")
+
+    df = pd.DataFrame(all_rows_conc)
     for col in ("price","chg_pct","amount","circ_mkt_cap","turnover","vol_ratio",
                 "open","high","low","prev_close"):
         if col in df.columns:
@@ -1211,12 +1272,16 @@ def get_realtime_quotes(codes: list = None) -> pd.DataFrame:
         if not _realtime_cache.empty and (now_ts - _realtime_cache_time) < REALTIME_CACHE_TTL:
             return _realtime_cache.copy()
 
+    # ★ v3.13 接口策略：
+    #   境外（GitHub Actions）东方财富 CDN 基本必失败且超时慢（30s+），
+    #   保留最快最稳的两个接口并发竞速：
+    #     priority=0  新浪财经  → 首选，境外成功率最高，拿到即立刻返回
+    #     priority=1  腾讯证券  → 备用，独立数据源，新浪失败时兜底
+    #   两个东方财富接口（akshare / push2直连）在境外已禁用，避免无谓等待。
     fetchers = [
-        (0, "akshare(东方财富)",      _fetch_spot_em),
-        (1, "新浪财经(境外稳定)",      _fetch_spot_sina),
-        (2, "东方财富直连(大页串行)",  _fetch_spot_em_backup),
-        (3, "腾讯证券(独立数据源)",    _fetch_spot_txzq),
-        (4, "通达信TCP(mootdx)",      _fetch_spot_tdx),
+        (0, "新浪财经(境外稳定)",      _fetch_spot_sina),
+        (1, "腾讯证券(独立数据源)",    _fetch_spot_txzq),
+        (2, "通达信TCP(mootdx)",      _fetch_spot_tdx),
     ]
     total = len(fetchers)
 
@@ -1228,28 +1293,27 @@ def get_realtime_quotes(codes: list = None) -> pd.DataFrame:
             df = fetcher()
             ok_q.put((priority, source, df))
         except ImportError as e:
-            # 依赖未安装（如 mootdx），静默跳过，不打 WARNING
             log.debug(f"[行情] {source} 跳过（依赖未安装）: {e}")
             err_q.put((source, e))
         except Exception as e:
             log.warning(f"[行情] {source} 接口失败: {e}")
             err_q.put((source, e))
 
-    # 全部作为 daemon 线程启动（主线程退出时自动杀掉，不阻塞进程）
+    # 全部作为 daemon 线程启动
     for priority, source, fetcher in fetchers:
         t = threading.Thread(target=_worker, args=(priority, source, fetcher), daemon=True)
         t.start()
 
-    # 等待：收到第一个成功结果后，再额外等 0.3s 捞优先级更高的结果
+    # 等待：priority=0（新浪）一旦成功立刻返回，无需等其他接口
     best: tuple | None = None          # (priority, source, df)
     finished_errors = 0
 
-    deadline = _time.time() + 60.0     # 最长等待 60s（4个接口里最慢的通达信约需 30s）
+    deadline = _time.time() + 90.0     # 最长等待 90s
     while _time.time() < deadline:
-        # 先把所有已到达的成功结果捞出来
+        # 捞所有已到达的成功结果，保留最高优先级的
         while True:
             try:
-                item = ok_q.get_nowait()   # (priority, source, df)
+                item = ok_q.get_nowait()
                 if best is None or item[0] < best[0]:
                     best = item
             except queue.Empty:
@@ -1264,18 +1328,18 @@ def get_realtime_quotes(codes: list = None) -> pd.DataFrame:
                 break
 
         if best is not None:
-            # 已有成功结果；若优先级最高的（priority=0）已到或全部接口已结束，立刻返回
-            all_done = (finished_errors + (1 if best else 0)) >= total
+            # priority=0（新浪）已到 → 立刻返回，不等其他接口
+            all_done = (finished_errors + 1) >= total
             if best[0] == 0 or all_done:
                 break
-            # 否则再等 0.3s，看有没有更高优先级的结果
-            _time.sleep(0.3)
+            # 有更低优先级结果，再等 0.5s 看新浪是否也完成
+            _time.sleep(0.5)
             continue
 
         if finished_errors >= total:
-            break   # 全部失败，不用再等
+            break   # 全部失败
 
-        _time.sleep(0.05)   # 短暂让出 CPU，避免空转
+        _time.sleep(0.05)
 
     if best is not None:
         _, best_source, df = best
