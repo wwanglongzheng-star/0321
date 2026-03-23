@@ -185,6 +185,7 @@ import requests
 import re
 import time
 import datetime
+import decimal as _decimal
 import logging
 import warnings
 import os
@@ -919,8 +920,25 @@ def _fetch_spot_sina() -> pd.DataFrame:
                 high    = float(fields[4]) if fields[4] else float("nan")
                 low     = float(fields[5]) if fields[5] else float("nan")
                 amt     = float(fields[9]) if fields[9] else float("nan")
+                vol     = float(fields[8]) if fields[8] else float("nan")   # 成交量(股)
                 chg_pct = (price - prev_c) / prev_c * 100 if prev_c else float("nan")
                 name    = fields[0]
+                # 新浪行情字段顺序（0-based）：
+                #   [0]名称 [1]今开 [2]昨收 [3]现价 [4]最高 [5]最低
+                #   [6]竞买价 [7]竞卖价 [8]成交量(股) [9]成交额(元)
+                #   [10]买一量 [11]买一价 [12]买二量 [13]买二价 ...
+                #   [20]卖一量 [21]卖一价 ...
+                buy1_vol   = float(fields[10]) if len(fields) > 10 and fields[10] else float("nan")
+                buy1_price = float(fields[11]) if len(fields) > 11 and fields[11] else float("nan")
+                # zt_price: 封板时买一挂在涨停价=最准来源；否则用昨收Decimal精确计算
+                _zt_calc = float(
+                    (_decimal.Decimal(str(round(prev_c, 2))) * _decimal.Decimal("1.10"))
+                    .quantize(_decimal.Decimal("0.01"), rounding=_decimal.ROUND_HALF_UP)
+                )
+                if buy1_price > 0 and abs(buy1_price - _zt_calc) <= 0.01:
+                    zt_price = buy1_price   # 买一挂在涨停价=封板中，直接用（最准）
+                else:
+                    zt_price = _zt_calc     # 未封板或竞价阶段，用昨收精确计算
             except (ValueError, IndexError):
                 continue
             if price <= 0 or prev_c <= 0:
@@ -934,6 +952,10 @@ def _fetch_spot_sina() -> pd.DataFrame:
                 "high":         high,
                 "low":          low,
                 "amount":       amt,
+                "vol":          vol,          # 成交量(股)，可用于计算量比
+                "buy1_price":   buy1_price,   # 买一报价（封板时=涨停价）
+                "buy1_vol":     buy1_vol,     # 买一申报量（封单量，越大封板越牢）
+                "zt_price":     zt_price,     # 今日涨停价（封板时取买一价，最准）
                 "chg_pct":      chg_pct,
                 "turnover":     float("nan"),
                 "circ_mkt_cap": float("nan"),
@@ -976,7 +998,7 @@ def _fetch_spot_sina() -> pd.DataFrame:
 
         df = pd.DataFrame(all_rows)
         for col in ("price","chg_pct","amount","circ_mkt_cap","turnover","vol_ratio",
-                    "open","high","low","prev_close"):
+                    "open","high","low","prev_close","vol","buy1_price","buy1_vol","zt_price"):
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
         return df
@@ -1035,7 +1057,7 @@ def _fetch_spot_sina() -> pd.DataFrame:
 
     df = pd.DataFrame(all_rows_conc)
     for col in ("price","chg_pct","amount","circ_mkt_cap","turnover","vol_ratio",
-                "open","high","low","prev_close"):
+                "open","high","low","prev_close","vol","buy1_price","buy1_vol","zt_price"):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
@@ -1860,6 +1882,9 @@ class DaBanSignal:
     open_rate:    float  = 0.0   # 历史打板次日高开率%
     buyable:      bool   = True  # 是否可以买进（买不进去的不推送）
     sub_strategy: str    = ""    # 竞价子策略标签（竞价-连板-极限 等），用于白名单过滤和紧急推送识别
+    # ★ 新增：来自实时行情的准确涨停价和封单量
+    zt_price:     float  = 0.0   # 今日涨停价（封板时取买一价，最准；未封板时用昨收计算）
+    seal_vol:     float  = 0.0   # 封单量(手)：买一申报量，越大封板越牢固
 
 
 # ================================================================
@@ -1869,7 +1894,31 @@ def is_st(name: str) -> bool:
     return "ST" in str(name).upper() or "退" in str(name)
 
 def calc_zt_price(prev_close: float) -> float:
-    return round(prev_close * 1.10, 2)
+    """计算涨停价，与交易所规则一致（Decimal精确四舍五入到分，避免浮点误差）"""
+    d = _decimal.Decimal(str(round(prev_close, 2))) * _decimal.Decimal("1.10")
+    return float(d.quantize(_decimal.Decimal("0.01"), rounding=_decimal.ROUND_HALF_UP))
+
+def get_zt_pct(code: str) -> float:
+    """
+    根据股票代码返回当日涨停幅度（小数形式）：
+      - 创业板（300xxx / 301xxx）：+20%
+      - 科创板（688xxx）         ：+20%
+      - 北交所（8xxxxx）         ：+30%
+      - 其余（主板 60/00 等）    ：+10%
+    """
+    c = str(code).zfill(6)
+    if c.startswith("300") or c.startswith("301") or c.startswith("688"):
+        return 0.20
+    if c.startswith("8"):
+        return 0.30
+    return 0.10
+
+def calc_zt_price_by_code(prev_close: float, code: str) -> float:
+    """按股票代码涨停幅度规则精确计算涨停价。"""
+    pct = get_zt_pct(code)
+    mul = _decimal.Decimal("1") + _decimal.Decimal(str(pct))
+    d = _decimal.Decimal(str(round(prev_close, 2))) * mul
+    return float(d.quantize(_decimal.Decimal("0.01"), rounding=_decimal.ROUND_HALF_UP))
 
 def position_score(hist: pd.DataFrame) -> float:
     if hist.empty or len(hist) < 20:
@@ -2369,11 +2418,16 @@ def scan_first_board(zt_df: pd.DataFrame, yesterday_zt_codes: set,
     # ── 阶段3：评分与信号生成 ─────────────────────────────────────────
     # 从全局实时行情缓存中提取各候选股的开盘价（用于高开秒板精确判断）
     _rt_open_map: dict = {}
+    _rt_zt_map:   dict = {}   # code -> zt_price（今日准确涨停价）
+    _rt_sv_map:   dict = {}   # code -> seal_vol（买一申报量/手，封单量）
     try:
         _rt_snap = get_realtime_quotes()
         if not _rt_snap.empty:
             for _, _rt_row in _rt_snap.iterrows():
-                _rt_open_map[str(_rt_row.get("code", "")).zfill(6)] = float(_rt_row.get("open", 0) or 0)
+                _c = str(_rt_row.get("code", "")).zfill(6)
+                _rt_open_map[_c] = float(_rt_row.get("open", 0) or 0)
+                _rt_zt_map[_c]   = float(_rt_row.get("zt_price", 0) or 0)
+                _rt_sv_map[_c]   = float(_rt_row.get("buy1_vol", 0) or 0)
     except Exception:
         pass
 
@@ -2392,6 +2446,11 @@ def scan_first_board(zt_df: pd.DataFrame, yesterday_zt_codes: set,
         row         = c["row"]
         hist        = hist_map.get(code, pd.DataFrame())
         open_price  = _rt_open_map.get(code, 0.0)   # 今日开盘价（来自实时行情）
+        # 今日准确涨停价（来自实时行情买一价，比price/1.10更准）
+        # fallback：用代码板块规则反推昨收再计算（创业板/北交所幅度不同）
+        _zt_pct     = get_zt_pct(code)
+        zt_p        = _rt_zt_map.get(code, 0.0) or calc_zt_price_by_code(round(price / (1 + _zt_pct), 2), code)
+        sv          = _rt_sv_map.get(code, 0.0)      # 封单量（手）
         try:
             # ★ 股性识别
             char_info = analyze_stock_character(hist, code)
@@ -2441,6 +2500,8 @@ def scan_first_board(zt_df: pd.DataFrame, yesterday_zt_codes: set,
                 f"量比{vol_ratio:.1f}x",
                 f"股性:{char_info['char_label']}(振幅{char_info['avg_amplitude']:.1f}%)",
             ]
+            if sv > 0:
+                reason_parts.append(f"封单{sv/100:.0f}万手")
             if seal_time > 0:
                 reason_parts.append(f"封板@{seal_time//100}:{seal_time%100:02d}")
             if trend_up:
@@ -2450,7 +2511,9 @@ def scan_first_board(zt_df: pd.DataFrame, yesterday_zt_codes: set,
             if fake_flags:
                 reason_parts.append(f"⚠️{'; '.join(fake_flags)}")
 
-            prev_close = round(price / 1.10, 2)
+            # ★ 止损用实时行情返回的准确昨收（按板块涨停幅度反推，创业板÷1.2，北交所÷1.3）
+            _zt_mult = 1 + get_zt_pct(code)
+            prev_close = round(zt_p / _zt_mult, 2) if zt_p > 0 else round(price / _zt_mult, 2)
             signals.append(DaBanSignal(
                 code=code, name=name, strategy="首板",
                 price=price, connect_days=1,
@@ -2468,6 +2531,8 @@ def scan_first_board(zt_df: pd.DataFrame, yesterday_zt_codes: set,
                 avg_amplitude=char_info["avg_amplitude"],
                 open_rate=char_info["open_rate"],
                 buyable=True,
+                zt_price=zt_p,
+                seal_vol=sv,
             ))
         except Exception as e:
             log.debug(f"首板评分异常 {code}: {e}")
@@ -2586,11 +2651,16 @@ def scan_connect_board(zt_df: pd.DataFrame, yesterday_zt_codes: set,
     # ── 阶段3：评分与信号生成 ─────────────────────────────────────────
     # 从全局实时行情缓存中提取各候选股的开盘价（用于高开秒板精确判断）
     _rt_open_map_lian: dict = {}
+    _rt_zt_map_lian:   dict = {}   # code -> zt_price
+    _rt_sv_map_lian:   dict = {}   # code -> seal_vol（买一申报量/手）
     try:
         _rt_snap_lian = get_realtime_quotes()
         if not _rt_snap_lian.empty:
             for _, _rt_row in _rt_snap_lian.iterrows():
-                _rt_open_map_lian[str(_rt_row.get("code", "")).zfill(6)] = float(_rt_row.get("open", 0) or 0)
+                _c2 = str(_rt_row.get("code", "")).zfill(6)
+                _rt_open_map_lian[_c2] = float(_rt_row.get("open", 0) or 0)
+                _rt_zt_map_lian[_c2]   = float(_rt_row.get("zt_price", 0) or 0)
+                _rt_sv_map_lian[_c2]   = float(_rt_row.get("buy1_vol", 0) or 0)
     except Exception:
         pass
 
@@ -2612,6 +2682,8 @@ def scan_connect_board(zt_df: pd.DataFrame, yesterday_zt_codes: set,
         row             = c["row"]
         hist            = hist_map.get(code, pd.DataFrame())
         open_price_lian = _rt_open_map_lian.get(code, 0.0)
+        zt_p_lian       = _rt_zt_map_lian.get(code, 0.0) or calc_zt_price_by_code(round(price / (1 + get_zt_pct(code)), 2), code)
+        sv_lian         = _rt_sv_map_lian.get(code, 0.0)   # 封单量（手）
         try:
             char_info = analyze_stock_character(hist, code)
             if not char_info["buyable"]:
@@ -2658,6 +2730,8 @@ def scan_connect_board(zt_df: pd.DataFrame, yesterday_zt_codes: set,
                 f"量比{vol_ratio:.1f}x",
                 f"股性:{char_info['char_label']}(振幅{char_info['avg_amplitude']:.1f}%)",
             ]
+            if sv_lian > 0:
+                reason_parts.append(f"封单{sv_lian/100:.0f}万手")
             if seal_time > 0:
                 reason_parts.append(f"封板@{seal_time//100}:{seal_time%100:02d}")
             if sec_msg:
@@ -2665,8 +2739,9 @@ def scan_connect_board(zt_df: pd.DataFrame, yesterday_zt_codes: set,
             if fake_flags:
                 reason_parts.append(f"⚠️{'; '.join(fake_flags)}")
 
-            # ★ 连板止损：基于昨收推算，不用涨停价×0.93（修正BUG-10）
-            prev_close_est = round(price / 1.10, 2) if price > 0 else 0
+            # ★ 连板止损：基于准确涨停价反推昨收（按板块幅度，创业板÷1.2，北交所÷1.3）
+            _zt_mult_lian  = 1 + get_zt_pct(code)
+            prev_close_est = round(zt_p_lian / _zt_mult_lian, 2) if zt_p_lian > 0 else round(price / _zt_mult_lian, 2)
             stop_loss_price = round(prev_close_est * 0.97, 2)   # 昨收-3%，与首板一致
 
             signals.append(DaBanSignal(
@@ -2686,11 +2761,11 @@ def scan_connect_board(zt_df: pd.DataFrame, yesterday_zt_codes: set,
                 avg_amplitude=char_info["avg_amplitude"],
                 open_rate=char_info["open_rate"],
                 buyable=True,
+                zt_price=zt_p_lian,
+                seal_vol=sv_lian,
             ))
         except Exception as e:
             log.debug(f"连板评分异常 {code}: {e}")
-
-    signals.sort(key=lambda x: (x.connect_days, x.score), reverse=True)
     return signals
 
 
@@ -2755,6 +2830,10 @@ def scan_auction_board() -> list:
             amount     = float(row.get("amount", 0) or 0)
             circ_cap   = float(row.get("circ_mkt_cap", 0) or 0)
             vol_ratio  = float(row.get("vol_ratio", 0) or 0)
+            # 来自实时行情的准确涨停价和封单量（新浪接口直接取）
+            # 优先用实时行情返回的涨停价（已根据板块精确计算），fallback 按代码板块规则计算
+            zt_p_auc   = float(row.get("zt_price", 0) or 0) or calc_zt_price_by_code(prev_close, code)
+            sv_auc     = float(row.get("buy1_vol", 0) or 0)
 
             if is_st(name) or code.startswith("688") or code.startswith("8"):
                 continue
@@ -2822,8 +2901,10 @@ def scan_auction_board() -> list:
                     score=round(score, 1),
                     reason=reason,
                     stop_loss=round(prev_close * 0.97, 2),
-                    entry_price=calc_zt_price(prev_close),
+                    entry_price=price,   # 竞价极限档已在涨停价参与竞价，直接用price
                     sub_strategy=_sub,
+                    zt_price=zt_p_auc,
+                    seal_vol=sv_auc,
                 ))
 
             # ── B档：中信号（量比大且高开3%~7%）────────────────────
@@ -2862,6 +2943,10 @@ def scan_auction_board() -> list:
                     b_reason += f" | 高度板风险⚠️({HEIGHT_BOARD_RISK_PENALTY}分)"
 
                 _sub_b = "竞价-连板-强势" if is_connect else "竞价-首板-强势"
+                # B档挂单价：开盘后追入，entry_price = price*1.01，但不得超过今日涨停价
+                _entry_b = round(price * 1.01, 2)
+                if zt_p_auc > 0:
+                    _entry_b = min(_entry_b, zt_p_auc)
                 signals.append(DaBanSignal(
                     code=code, name=name, strategy="竞价",
                     price=price, connect_days=zt_streak if is_connect else 0,
@@ -2870,8 +2955,10 @@ def scan_auction_board() -> list:
                     score=round(score, 1),
                     reason=b_reason,
                     stop_loss=round(prev_close * 0.96, 2),
-                    entry_price=round(price * 1.01, 2),
+                    entry_price=_entry_b,   # 不超过涨停价
                     sub_strategy=_sub_b,
+                    zt_price=zt_p_auc,
+                    seal_vol=sv_auc,
                 ))
 
         except Exception as e:
@@ -2907,6 +2994,7 @@ def scan_dt_recover(dt_yesterday_df: pd.DataFrame) -> list:
             prev_close = float(row.get("prev_close", 0) or 0)
             circ_cap   = float(row.get("circ_mkt_cap", 0) or 0)
             amount     = float(row.get("amount", 0) or 0)
+            zt_p_dt    = float(row.get("zt_price", 0) or 0) or calc_zt_price_by_code(prev_close, code)
 
             if is_st(name) or code.startswith("688"):
                 continue
@@ -2920,6 +3008,11 @@ def scan_dt_recover(dt_yesterday_df: pd.DataFrame) -> list:
 
             score = min(chg_pct / 0.10, 1.0) * 60 + min(circ_cap / 1e10, 1.0) * 20 + 20
 
+            # 反包挂单价：price*1.002，但不得超过今日涨停价（竞价反包阶段涨幅尚未到顶）
+            _entry_dt = round(price * 1.002, 2)
+            if zt_p_dt > 0:
+                _entry_dt = min(_entry_dt, zt_p_dt)
+
             signals.append(DaBanSignal(
                 code=code, name=name, strategy="反包",
                 price=price, connect_days=-1,
@@ -2928,7 +3021,8 @@ def scan_dt_recover(dt_yesterday_df: pd.DataFrame) -> list:
                 score=round(score, 1),
                 reason=f"昨跌停反包 | 今+{chg_pct:.1%} | 流通{circ_cap/1e8:.0f}亿",
                 stop_loss=round(prev_close * 0.97, 2),
-                entry_price=round(price * 1.002, 2)
+                entry_price=_entry_dt,
+                zt_price=zt_p_dt,
             ))
         except Exception as e:
             log.debug(f"反包异常: {e}")
@@ -4134,6 +4228,27 @@ def filter_invalid_signals(signals: list) -> tuple:
                 reject_reason = (f"★v9.1分时量比持续性不足"
                                  f"(日量/均量={intraday_vol_sustain:.2f}<{INTRADAY_VOL_SUSTAIN_RATIO}，盘中无人接盘)")
 
+        # ── 规则0：已涨停无操作空间过滤 ─────────────────────────────
+        # 首板/连板策略本身就是在涨停板打板（entry_price = price = zt_price），属于正常，不过滤。
+        # 其余策略（竞价B档、反包等）如果现价已经达到或超过当日涨停价，
+        # 买入挂单价也会 >= 涨停价，交易所会拒单或无法成交 → 直接过滤。
+        if not reject_reason and sig.strategy not in ("首板", "连板"):
+            _code   = str(getattr(sig, "code", "") or "").zfill(6)
+            _price  = float(sig.price or 0)
+            _zt_p   = float(sig.zt_price or 0)
+            # 若信号中没有 zt_price，用 entry_price 反推（保守做法）
+            if _zt_p <= 0 and sig.entry_price > 0:
+                # entry_price 是保护后的值（不超过zt_price），zt_price缺失时跳过
+                _zt_p = 0
+            if _zt_p > 0 and _price >= _zt_p:
+                _board_type = {0.20: "创业板/科创板", 0.30: "北交所"}.get(
+                    get_zt_pct(_code), "主板"
+                )
+                reject_reason = (
+                    f"现价{_price:.2f}已达{_board_type}涨停价{_zt_p:.2f}"
+                    f"（+{get_zt_pct(_code):.0%}），无操作空间"
+                )
+
         # ── 规则1：评分门槛 ──────────────────────────────────────
         if not reject_reason:
             min_score = PUSH_MIN_SCORE.get(sig.strategy, 40)
@@ -4231,12 +4346,20 @@ def format_signal(sig: DaBanSignal, rank: int, market_state: str = "", emotion: 
         if _advice:
             exit_line = f"{_advice}\n"
 
+    # 封单量行（首板/连板时展示，帮助判断封板牢固程度）
+    seal_vol_line = ""
+    if sig.seal_vol > 0 and sig.strategy in ("首板", "连板"):
+        # buy1_vol 单位是"手"（新浪接口）；1手=100股；1万手=10000手
+        _sv_wan = sig.seal_vol / 10000
+        seal_vol_line = f"**封单量**：{_sv_wan:.1f}万手（买一挂单，越大封板越牢）\n"
+
     return (
         f"### {rank}. {icon}{sig.name}（{sig.code}）\n"
         f"**策略**：{sig.strategy} | **评分**：{sig.score:.0f}分\n"
         f"**现价**：{sig.price:.2f} | **挂单价**：{sig.entry_price:.2f} | **止损**：{sig.stop_loss:.2f}\n"
         f"{board_line}"
         f"{seal_line}**换手**：{sig.turnover:.1f}% | **流通市值**：{sig.circ_mkt_cap:.0f}亿\n"
+        f"{seal_vol_line}"
         f"{time_line}"
         f"{char_line}"
         f"{risk_line}"
@@ -5571,7 +5694,7 @@ def scan_midway_surge() -> list:
                 low     = float(row.get("low",         0) or 0)
                 vol_r   = float(row.get("vol_ratio",   0) or 0)
                 amount  = float(row.get("amount",      0) or 0)
-                circ_c  = float(row.get("circ_cap",    0) or 0)
+                circ_c  = float(row.get("circ_mkt_cap", 0) or 0)  # 统一用 circ_mkt_cap（原用circ_cap已修复）
 
                 if price <= 0 or prev_c <= 0:
                     continue
@@ -6044,7 +6167,7 @@ def scan_tail_arb() -> list:
                 low    = float(row.get("low",        0) or 0)
                 vol_r  = float(row.get("vol_ratio",  0) or 0)
                 amount = float(row.get("amount",     0) or 0)
-                circ_c = float(row.get("circ_cap",   0) or 0)
+                circ_c = float(row.get("circ_mkt_cap", 0) or 0)  # 统一用 circ_mkt_cap（原用circ_cap已修复）
 
                 if price <= 0 or prev_c <= 0:
                     continue
