@@ -719,6 +719,8 @@ def get_realtime_quotes(codes: list = None) -> pd.DataFrame:
     ★ v3.4 性能优化：全市场行情（codes=None）启用全局缓存，TTL=55秒。
     同一轮扫描中多个子函数调用此函数只发送一次网络请求，大幅降低akshare请求频率。
     指定 codes（小列表）时绕过缓存，直接过滤缓存数据。
+    ★ v3.5 修复：RemoteDisconnected/Connection aborted 时指数退避重试（最多3次），
+               重试前优先返回缓存，避免开盘前高频请求被服务端限流断开。
     """
     global _realtime_cache, _realtime_cache_time
     import time as _time
@@ -728,31 +730,42 @@ def get_realtime_quotes(codes: list = None) -> pd.DataFrame:
         # 全市场请求：优先使用缓存
         if not _realtime_cache.empty and (now_ts - _realtime_cache_time) < REALTIME_CACHE_TTL:
             return _realtime_cache.copy()
-    try:
-        df = ak.stock_zh_a_spot_em()
-        if df is None or df.empty:
-            return pd.DataFrame()
-        df = df.rename(columns={
-            "代码": "code", "名称": "name", "最新价": "price",
-            "涨跌幅": "chg_pct", "成交额": "amount",
-            "流通市值": "circ_mkt_cap", "换手率": "turnover",
-            "量比": "vol_ratio", "今开": "open",
-            "最高": "high", "最低": "low", "昨收": "prev_close"
-        })
-        # 更新全市场缓存
-        if codes is None:
-            _realtime_cache      = df.copy()
-            _realtime_cache_time = now_ts
-        if codes:
-            df = df[df["code"].isin([str(c).zfill(6) for c in codes])].reset_index(drop=True)
-        return df
-    except Exception as e:
-        log.error(f"获取实时行情失败: {e}")
-        # 失败时若缓存存在则降级使用（允许稍旧数据）
-        if codes is None and not _realtime_cache.empty:
-            log.warning("行情请求失败，降级使用缓存数据")
-            return _realtime_cache.copy()
-        return pd.DataFrame()
+
+    max_retries = 3
+    last_error = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            df = ak.stock_zh_a_spot_em()
+            if df is None or df.empty:
+                return pd.DataFrame()
+            df = df.rename(columns={
+                "代码": "code", "名称": "name", "最新价": "price",
+                "涨跌幅": "chg_pct", "成交额": "amount",
+                "流通市值": "circ_mkt_cap", "换手率": "turnover",
+                "量比": "vol_ratio", "今开": "open",
+                "最高": "high", "最低": "low", "昨收": "prev_close"
+            })
+            # 更新全市场缓存
+            if codes is None:
+                _realtime_cache      = df.copy()
+                _realtime_cache_time = _time.time()
+            if codes:
+                df = df[df["code"].isin([str(c).zfill(6) for c in codes])].reset_index(drop=True)
+            return df
+        except Exception as e:
+            last_error = e
+            log.error(f"{attempt} [ERROR] 获取实时行情失败: {e}")
+            # 失败时若缓存存在，先返回缓存（不继续重试，避免雪崩）
+            if codes is None and not _realtime_cache.empty:
+                log.warning("行情请求失败，降级使用缓存数据")
+                return _realtime_cache.copy()
+            if attempt < max_retries:
+                wait = 2 ** attempt  # 指数退避：2s, 4s
+                log.info(f"行情请求失败，{wait}s 后重试（第{attempt}次）...")
+                _time.sleep(wait)
+    # 全部重试失败
+    log.error(f"获取实时行情：{max_retries}次重试均失败，最后错误: {last_error}")
+    return pd.DataFrame()
 
 def get_hist_kline(code: str, days: int = 60) -> pd.DataFrame:
     """获取历史日线（带炸板统计字段）"""
@@ -5654,9 +5667,16 @@ def main():
 
             # ★ v3.4 性能：每轮扫描开始时主动刷新全市场行情缓存一次
             # 后续所有子扫描函数（washout/shadow/intraday_dip等）复用此缓存，不再重复请求
+            # ★ v3.5 修复：pre_auction（集合竞价）阶段请求间隔仅45s，东方财富接口在开盘前
+            #   限流严重，频繁请求触发 RemoteDisconnected。竞价阶段行情变动慢，缓存90s足够。
             if phase in ("pre_auction", "opening", "morning", "afternoon", "pre_close"):
                 global _realtime_cache, _realtime_cache_time
-                _realtime_cache_time = 0.0   # 强制过期，触发下次 get_realtime_quotes() 时刷新
+                import time as _t
+                _cache_age = _t.time() - _realtime_cache_time
+                # 竞价阶段90s内不强制刷新（普通盘中55s），避免开盘前高频限流
+                _force_ttl = 90.0 if phase == "pre_auction" else REALTIME_CACHE_TTL
+                if _cache_age >= _force_ttl:
+                    _realtime_cache_time = 0.0   # 强制过期，触发下次 get_realtime_quotes() 时刷新
                 # 预拉取（提前缓存，让后续所有扫描直接命中缓存）
                 get_realtime_quotes()
 
