@@ -508,6 +508,8 @@ _market_cache_time: float = 0.0
 _realtime_cache: pd.DataFrame = pd.DataFrame()
 _realtime_cache_time: float = 0.0
 REALTIME_CACHE_TTL: float = 55.0    # 行情缓存有效期55秒（略小于90秒扫描间隔）
+# ★ v3.7：腾讯行情接口全市场代码列表缓存（一次获取后长期复用，避免开盘封锁时反复请求）
+_TXZQ_CODES_CACHE: list = []         # 全市场股票代码列表缓存（6位字符串）
 # ★ v3.1：定时心跳推送（每小时推一次「系统在线+市场状态」，确认系统正常）
 _HEARTBEAT_PUSHED_HOURS: set = set() # 已推送心跳的小时集合（9,10,11,13,14）
 # ★ v4.0：尾盘套利每日只推一次标记
@@ -855,11 +857,35 @@ def _fetch_spot_em_backup() -> pd.DataFrame:
     return _em_build_df(all_rows)
 
 
+def _txzq_build_fallback_codes() -> list:
+    """
+    规则生成全市场A股代码列表（完全离线，不依赖任何网络请求）。
+    覆盖范围：沪市主板/科创板 + 深市主板/中小板/创业板/北交所，约5500个代码。
+    腾讯接口对无效代码返回空数据行（不报错），多发送几百个无效代码无任何影响。
+    """
+    codes = []
+    # 沪市主板：600000-609999
+    codes += [f"{i:06d}" for i in range(600000, 610000)]
+    # 沪市科创板：688000-689999
+    codes += [f"{i:06d}" for i in range(688000, 690000)]
+    # 深市主板/中小板：000001-002999
+    codes += [f"{i:06d}" for i in range(1, 3000)]
+    # 深市创业板：300001-301999
+    codes += [f"{i:06d}" for i in range(300001, 302000)]
+    # 北交所：830000-839999、430000-439999、920000-929999
+    codes += [f"{i:06d}" for i in range(830000, 840000)]
+    codes += [f"{i:06d}" for i in range(430000, 440000)]
+    codes += [f"{i:06d}" for i in range(920000, 930000)]
+    return codes
+
+
 def _fetch_spot_txzq() -> pd.DataFrame:
     """
     第三接口：腾讯证券行情直连（qt.gtimg.cn），与东方财富/新浪完全独立的第三数据源。
     腾讯行情接口反爬宽松，开盘高峰期稳定性强。
     每批150个股票代码，串行请求（全市场约5000只，约34批）。
+    ★ v3.7：代码列表优先用全局缓存，缓存为空时尝试 akshare 获取，
+             akshare 也失败则用规则离线生成兜底，彻底脱离对 akshare 的依赖。
 
     腾讯返回格式（GBK编码）：
       v_sh600000="1~浦发银行~600000~现价~昨收~今开~最高~最低~买一~卖一~成交量~成交额(万元)~...~涨跌幅~换手率~...";
@@ -869,13 +895,24 @@ def _fetch_spot_txzq() -> pd.DataFrame:
     """
     import re as _re
     import time as _t
+    global _TXZQ_CODES_CACHE
 
-    # 1. 获取全市场代码列表
-    try:
-        code_df = ak.stock_info_a_code_name()
-        all_codes = code_df["code"].astype(str).str.zfill(6).tolist()
-    except Exception as e:
-        raise ValueError(f"获取股票代码列表失败: {e}")
+    # 1. 获取全市场代码列表（缓存 → akshare → 离线规则兜底）
+    all_codes: list = []
+    if _TXZQ_CODES_CACHE:
+        all_codes = _TXZQ_CODES_CACHE
+        log.debug(f"[腾讯行情] 使用缓存代码列表（{len(all_codes)} 只）")
+    else:
+        try:
+            code_df = ak.stock_info_a_code_name()
+            all_codes = code_df["code"].astype(str).str.zfill(6).tolist()
+            if all_codes:
+                _TXZQ_CODES_CACHE = all_codes   # 成功则写入缓存
+                log.info(f"[腾讯行情] 代码列表已缓存（{len(all_codes)} 只）")
+        except Exception as e:
+            log.warning(f"[腾讯行情] akshare 代码列表获取失败（{e}），改用离线规则生成")
+            all_codes = _txzq_build_fallback_codes()
+            log.info(f"[腾讯行情] 离线规则生成代码 {len(all_codes)} 个（含无效代码，腾讯接口自动忽略）")
 
     if not all_codes:
         raise ValueError("全市场代码列表为空")
@@ -950,6 +987,70 @@ def _fetch_spot_txzq() -> pd.DataFrame:
     return df
 
 
+def _fetch_spot_tdx() -> pd.DataFrame:
+    """
+    第四接口：通达信行情服务器（mootdx），走 TCP 协议，与所有 HTTP 接口完全独立。
+    不受东方财富/腾讯开盘反爬封锁影响，实时行情延迟约 3 秒。
+    ★ v3.7：作为最终兜底接口，全部 HTTP 接口失败时自动切换。
+
+    mootdx 返回字段：code/name/open/high/low/pre_close/price/volume/amount
+    需自行计算：chg_pct = (price - pre_close) / pre_close * 100
+    无法获取：circ_mkt_cap / vol_ratio / turnover（填 nan）
+    """
+    try:
+        from mootdx.quotes import Quotes as _Quotes
+    except ImportError:
+        raise ImportError("mootdx 未安装，请在 requirements.txt 中添加 mootdx 并重新安装")
+
+    client = _Quotes.factory(market='std', multithread=True, heartbeat=False)
+    try:
+        df = client.stocks()
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+    if df is None or df.empty:
+        raise ValueError("mootdx 通达信接口返回空数据")
+
+    # 字段重命名：pre_close → prev_close
+    col_map = {
+        "pre_close":  "prev_close",
+        "last_close": "prev_close",   # 部分版本字段名不同
+    }
+    df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
+
+    # 过滤非A股（只保留 000/001/002/003/300/301/600/601/603/605/688/689/8/43/92 开头）
+    if "code" in df.columns:
+        df["code"] = df["code"].astype(str).str.zfill(6)
+        df = df[df["code"].str.match(r'^(00[0-3]|30[01]|60[0135]|688|689|8[3-9]|43|92)')].copy()
+
+    # 自行计算涨跌幅
+    if "price" in df.columns and "prev_close" in df.columns:
+        pc = pd.to_numeric(df["prev_close"], errors="coerce").replace(0, float("nan"))
+        pr = pd.to_numeric(df["price"],      errors="coerce")
+        df["chg_pct"] = (pr - pc) / pc * 100
+    else:
+        df["chg_pct"] = float("nan")
+
+    # 补全缺失字段（circ_mkt_cap / vol_ratio / turnover 通达信无此数据）
+    for col in ("circ_mkt_cap", "vol_ratio", "turnover"):
+        if col not in df.columns:
+            df[col] = float("nan")
+
+    keep = [c for c in ("code","name","price","chg_pct","amount","circ_mkt_cap",
+                         "turnover","vol_ratio","open","high","low","prev_close")
+            if c in df.columns]
+    df = df[keep].copy()
+
+    for col in ("price","chg_pct","amount","open","high","low","prev_close"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    return df.reset_index(drop=True)
+
+
 def get_realtime_quotes(codes: list = None) -> pd.DataFrame:
     """
     获取实时行情。
@@ -968,11 +1069,12 @@ def get_realtime_quotes(codes: list = None) -> pd.DataFrame:
         if not _realtime_cache.empty and (now_ts - _realtime_cache_time) < REALTIME_CACHE_TTL:
             return _realtime_cache.copy()
 
-    # 依次尝试：① akshare东财  ② push2直连  ③ 腾讯证券（完全不同数据源）
+    # 依次尝试：① akshare东财  ② push2直连  ③ 腾讯证券  ④ 通达信TCP（完全独立通道）
     fetchers = [
         ("akshare(东方财富)", _fetch_spot_em),
         ("东方财富直连(大页串行)", _fetch_spot_em_backup),
         ("腾讯证券(独立数据源)", _fetch_spot_txzq),
+        ("通达信TCP(mootdx)", _fetch_spot_tdx),
     ]
     last_error = None
     for source, fetcher in fetchers:
