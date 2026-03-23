@@ -870,6 +870,116 @@ def _fetch_spot_em_backup() -> pd.DataFrame:
     return _em_build_df(all_rows)
 
 
+def _fetch_spot_sina() -> pd.DataFrame:
+    """
+    新浪财经行情接口（境外访问最稳定的免费方案）。
+
+    特点：
+    - 接口在境外（GitHub Actions）访问成功率远高于东方财富
+    - 每批最多 800 只股票，一次请求覆盖全市场约 5600 只 A 股（约 7 批）
+    - 无需鉴权，无 Cookie/Token，反爬极宽松
+    - 返回字段：现价/开/高/低/昨收/成交量/成交额，但无量比/流通市值
+
+    格式：var hq_str_sh600000="浦发银行,10.55,10.50,10.58,10.62,10.45,..."
+    字段（逗号分割，0-based）：
+      [0]=名称  [1]=今开  [2]=昨收  [3]=现价  [4]=最高  [5]=最低
+      [6]=买一  [7]=卖一  [8]=成交量(股)  [9]=成交额(元)  ...  [31]=涨跌幅
+    """
+    import re as _re
+    import time as _t
+
+    _SINA_URL  = "https://hq.sinajs.cn/list={syms}"
+    _SINA_HEADERS = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer":    "https://finance.sina.com.cn/",
+        "Accept":     "text/plain,*/*",
+    }
+    _LINE_RE = _re.compile(r'hq_str_(?:sh|sz)(\d{6})="([^"]+)"')
+
+    # 使用与腾讯接口相同的离线代码表（已缓存，通常不需重新生成）
+    global _TXZQ_CODES_CACHE
+    all_codes: list = []
+    if _TXZQ_CODES_CACHE:
+        all_codes = _TXZQ_CODES_CACHE
+    else:
+        all_codes = _txzq_build_fallback_codes()
+        _TXZQ_CODES_CACHE = all_codes
+
+    def _to_sina_sym(c: str) -> str:
+        return ("sh" if c.startswith(("6", "9")) else "sz") + c
+
+    _BATCH    = 800     # 新浪单次最多 800 只
+    _TIMEOUT  = 10
+    _MAX_CONSEC_FAIL = 3   # 连续3批失败即放弃
+
+    all_rows  = []
+    consec_fail = 0
+    sess = _em_make_session(_SINA_HEADERS)
+    try:
+        for i in range(0, len(all_codes), _BATCH):
+            batch = all_codes[i: i + _BATCH]
+            syms  = ",".join(_to_sina_sym(c) for c in batch)
+            try:
+                r = sess.get(_SINA_URL.format(syms=syms), timeout=_TIMEOUT)
+                r.encoding = "gbk"
+                text = r.text
+                consec_fail = 0
+            except Exception:
+                consec_fail += 1
+                if consec_fail >= _MAX_CONSEC_FAIL:
+                    raise ValueError(f"新浪行情接口连续 {consec_fail} 批失败，判定网络不通")
+                _t.sleep(0.2)
+                continue
+
+            for m in _LINE_RE.finditer(text):
+                code = m.group(1).zfill(6)
+                fields = m.group(2).split(",")
+                if len(fields) < 10 or not fields[3]:
+                    continue
+                try:
+                    prev_c = float(fields[2]) if fields[2] else float("nan")
+                    price  = float(fields[3]) if fields[3] else float("nan")
+                    open_p = float(fields[1]) if fields[1] else float("nan")
+                    high   = float(fields[4]) if fields[4] else float("nan")
+                    low    = float(fields[5]) if fields[5] else float("nan")
+                    vol    = float(fields[8]) if fields[8] else float("nan")   # 成交量(股)
+                    amt    = float(fields[9]) if fields[9] else float("nan")   # 成交额(元)
+                    chg_pct = (price - prev_c) / prev_c * 100 if prev_c else float("nan")
+                    name   = fields[0]
+                except (ValueError, IndexError):
+                    continue
+                if price <= 0 or prev_c <= 0:
+                    continue
+                all_rows.append({
+                    "code":         code,
+                    "name":         name,
+                    "price":        price,
+                    "prev_close":   prev_c,
+                    "open":         open_p,
+                    "high":         high,
+                    "low":          low,
+                    "amount":       amt,
+                    "chg_pct":      chg_pct,
+                    "turnover":     float("nan"),    # 新浪无换手率
+                    "circ_mkt_cap": float("nan"),    # 新浪无流通市值
+                    "vol_ratio":    float("nan"),    # 新浪无量比
+                })
+            if i + _BATCH < len(all_codes):
+                _t.sleep(0.1)
+    finally:
+        sess.close()
+
+    if not all_rows:
+        raise ValueError("新浪行情接口返回空数据")
+
+    df = pd.DataFrame(all_rows)
+    for col in ("price","chg_pct","amount","circ_mkt_cap","turnover","vol_ratio",
+                "open","high","low","prev_close"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+
 def _txzq_build_fallback_codes() -> list:
     """
     规则生成全市场A股代码列表（完全离线，不依赖任何网络请求）。
@@ -1103,9 +1213,10 @@ def get_realtime_quotes(codes: list = None) -> pd.DataFrame:
 
     fetchers = [
         (0, "akshare(东方财富)",      _fetch_spot_em),
-        (1, "东方财富直连(大页串行)",  _fetch_spot_em_backup),
-        (2, "腾讯证券(独立数据源)",    _fetch_spot_txzq),
-        (3, "通达信TCP(mootdx)",      _fetch_spot_tdx),
+        (1, "新浪财经(境外稳定)",      _fetch_spot_sina),
+        (2, "东方财富直连(大页串行)",  _fetch_spot_em_backup),
+        (3, "腾讯证券(独立数据源)",    _fetch_spot_txzq),
+        (4, "通达信TCP(mootdx)",      _fetch_spot_tdx),
     ]
     total = len(fetchers)
 
