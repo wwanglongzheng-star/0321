@@ -1025,7 +1025,7 @@ def _fetch_spot_tdx() -> pd.DataFrame:
     try:
         from mootdx.quotes import Quotes as _Quotes
     except ImportError:
-        raise ImportError("mootdx 未安装，请在 requirements.txt 中添加 mootdx 并重新安装")
+        raise ImportError("mootdx 未安装（pip install mootdx），跳过通达信接口")
 
     client = _Quotes.factory(market='std', multithread=True, heartbeat=False)
     try:
@@ -1078,69 +1078,97 @@ def _fetch_spot_tdx() -> pd.DataFrame:
 
 def get_realtime_quotes(codes: list = None) -> pd.DataFrame:
     """
-    获取实时行情（v3.10 并发竞速版）。
+    获取实时行情（v3.11 真正并发竞速版）。
 
-    ★ 核心改进：4个接口同时启动，谁先成功就立刻返回，其余后台自然结束。
-      串行最坏情况（全部超时）耗时 = 4接口之和；并发最坏情况 = 最慢的那一个。
-      正常情况下东方财富/腾讯任意一个通就能在 10s 内完成，不再等待其他接口。
+    ★ 并发设计：4个接口同时启动，任何一个成功立刻返回，不等其余接口。
+      用 queue.Queue 传递结果，主线程阻塞在 queue.get() 上，第一个成功的线程
+      put 结果后主线程立刻拿到并返回，其余线程在后台自然结束（daemon线程）。
 
-    ★ 优先级保留：akshare东财 > push2直连 > 腾讯证券 > 通达信TCP。
-      当多个接口同时成功时，使用字段最完整的（东财有 vol_ratio/circ_mkt_cap，
-      腾讯/通达信无此字段），通过 source_priority 排名决定优先采用哪个结果。
+    ★ 优先级机制：queue 里放 (priority, source, df)，主线程收到第一个成功结果
+      后再等 0.3s 捞一次队列，如果有更高优先级（字段更完整）的结果也已就绪则
+      优先用它（东财有 vol_ratio/circ_mkt_cap，腾讯/通达信缺失这两个字段）。
 
-    ★ v3.4 缓存：全市场行情启用 TTL=55s 缓存，同一轮多次调用只发一次请求。
-    ★ v3.6 降级：全部接口失败时容忍 5 分钟内旧缓存，应对开盘瞬间短暂断连。
+    ★ v3.4 缓存：全市场行情 TTL=55s，同一轮多次调用只发一次请求。
+    ★ v3.6 降级：全部失败时容忍 5 分钟内旧缓存，应对开盘瞬间短暂断连。
     """
     import time as _time
-    from concurrent.futures import ThreadPoolExecutor, as_completed, Future
+    import queue
+    import threading
     global _realtime_cache, _realtime_cache_time
     now_ts = _time.time()
 
     if codes is None:
-        # 全市场请求：优先使用缓存（TTL内直接返回，不发任何请求）
         if not _realtime_cache.empty and (now_ts - _realtime_cache_time) < REALTIME_CACHE_TTL:
             return _realtime_cache.copy()
 
-    # 4个接口并发启动，priority越小越优先（多个同时成功时取priority最小的）
     fetchers = [
         (0, "akshare(东方财富)",      _fetch_spot_em),
         (1, "东方财富直连(大页串行)",  _fetch_spot_em_backup),
         (2, "腾讯证券(独立数据源)",    _fetch_spot_txzq),
         (3, "通达信TCP(mootdx)",      _fetch_spot_tdx),
     ]
+    total = len(fetchers)
 
-    results: dict = {}    # priority → df
-    errors:  dict = {}    # source_name → exception
+    ok_q:   queue.Queue = queue.Queue()   # (priority, source, df)
+    err_q:  queue.Queue = queue.Queue()   # (source, exc)
 
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        future_map: dict[Future, tuple] = {
-            pool.submit(fetcher): (priority, source)
-            for priority, source, fetcher in fetchers
-        }
-        for fut in as_completed(future_map):
-            priority, source = future_map[fut]
+    def _worker(priority: int, source: str, fetcher):
+        try:
+            df = fetcher()
+            ok_q.put((priority, source, df))
+        except ImportError as e:
+            # 依赖未安装（如 mootdx），静默跳过，不打 WARNING
+            log.debug(f"[行情] {source} 跳过（依赖未安装）: {e}")
+            err_q.put((source, e))
+        except Exception as e:
+            log.warning(f"[行情] {source} 接口失败: {e}")
+            err_q.put((source, e))
+
+    # 全部作为 daemon 线程启动（主线程退出时自动杀掉，不阻塞进程）
+    for priority, source, fetcher in fetchers:
+        t = threading.Thread(target=_worker, args=(priority, source, fetcher), daemon=True)
+        t.start()
+
+    # 等待：收到第一个成功结果后，再额外等 0.3s 捞优先级更高的结果
+    best: tuple | None = None          # (priority, source, df)
+    finished_errors = 0
+
+    deadline = _time.time() + 60.0     # 最长等待 60s（4个接口里最慢的通达信约需 30s）
+    while _time.time() < deadline:
+        # 先把所有已到达的成功结果捞出来
+        while True:
             try:
-                df = fut.result()
-                results[priority] = (source, df)
-                log.debug(f"[行情] {source} 成功，行数={len(df)}")
-                # 拿到最高优先级的结果后，无需等其他接口——继续收集已完成的 future
-                # （其他线程会在自己超时后自然结束，不会阻塞主线程）
-            except Exception as e:
-                errors[source] = e
-                log.warning(f"[行情] {source} 接口失败: {e}")
+                item = ok_q.get_nowait()   # (priority, source, df)
+                if best is None or item[0] < best[0]:
+                    best = item
+            except queue.Empty:
+                break
 
-    if results:
-        # 取优先级最高（数字最小）的成功结果
-        best_priority = min(results.keys())
-        best_source, df = results[best_priority]
+        # 统计已报错数量
+        while True:
+            try:
+                err_q.get_nowait()
+                finished_errors += 1
+            except queue.Empty:
+                break
 
-        # 如果有更高优先级接口也成功了，记录一下（便于调试）
-        if len(results) > 1:
-            winner_names = [results[p][0] for p in sorted(results.keys())]
-            log.info(f"[行情] 并发竞速完成，{len(results)}个接口成功: {winner_names}，采用: {best_source}")
-        else:
-            log.debug(f"[行情] 采用: {best_source}")
+        if best is not None:
+            # 已有成功结果；若优先级最高的（priority=0）已到或全部接口已结束，立刻返回
+            all_done = (finished_errors + (1 if best else 0)) >= total
+            if best[0] == 0 or all_done:
+                break
+            # 否则再等 0.3s，看有没有更高优先级的结果
+            _time.sleep(0.3)
+            continue
 
+        if finished_errors >= total:
+            break   # 全部失败，不用再等
+
+        _time.sleep(0.05)   # 短暂让出 CPU，避免空转
+
+    if best is not None:
+        _, best_source, df = best
+        log.info(f"[行情] 采用: {best_source}，行数={len(df)}")
         if codes is None:
             _realtime_cache      = df.copy()
             _realtime_cache_time = _time.time()
@@ -1148,9 +1176,8 @@ def get_realtime_quotes(codes: list = None) -> pd.DataFrame:
             df = df[df["code"].isin([str(c).zfill(6) for c in codes])].reset_index(drop=True)
         return df
 
-    # 全部接口失败 → 降级使用缓存（容忍 5 分钟内旧缓存）
-    last_errors = "; ".join(f"{s}: {e}" for s, e in errors.items())
-    log.error(f"[行情] 所有接口均失败: {last_errors}")
+    # 全部接口失败 → 降级使用缓存
+    log.error("[行情] 所有接口均失败")
     _CACHE_FALLBACK_TTL = 300.0
     if codes is None and not _realtime_cache.empty:
         cache_age = now_ts - _realtime_cache_time
@@ -1158,7 +1185,7 @@ def get_realtime_quotes(codes: list = None) -> pd.DataFrame:
             log.warning(f"[行情] 降级使用缓存数据（缓存年龄 {cache_age:.0f}s）")
             return _realtime_cache.copy()
         else:
-            log.error(f"[行情] 缓存已过期（{cache_age:.0f}s > {_CACHE_FALLBACK_TTL}s），返回空数据")
+            log.error(f"[行情] 缓存已过期（{cache_age:.0f}s），返回空数据")
     return pd.DataFrame()
 
 def get_hist_kline(code: str, days: int = 60) -> pd.DataFrame:
