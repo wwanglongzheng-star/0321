@@ -855,14 +855,55 @@ def _fetch_spot_em_backup() -> pd.DataFrame:
     return _em_build_df(all_rows)
 
 
+def _fetch_spot_sina() -> pd.DataFrame:
+    """
+    第三接口：akshare stock_zh_a_spot()，数据来源为新浪财经，
+    与东方财富完全独立，东方财富封锁时的终极备用。
+    新浪行情字段较少（无流通市值/量比），用 NaN 补全缺失列。
+    """
+    df = ak.stock_zh_a_spot()
+    if df is None or df.empty:
+        raise ValueError("stock_zh_a_spot(新浪) 返回空数据")
+    # 新浪列名映射
+    col_map = {
+        "代码":     "code",
+        "名称":     "name",
+        "最新价":   "price",
+        "涨跌幅":   "chg_pct",
+        "成交额":   "amount",
+        "换手率":   "turnover",
+        "今开":     "open",
+        "最高":     "high",
+        "最低":     "low",
+        "昨收":     "prev_close",
+        # 新浪不直接提供这两列，下面补 NaN
+    }
+    df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
+    # 补全东方财富有但新浪没有的列
+    for missing_col in ("circ_mkt_cap", "vol_ratio"):
+        if missing_col not in df.columns:
+            df[missing_col] = float("nan")
+    keep = [c for c in ("code","name","price","chg_pct","amount","circ_mkt_cap",
+                         "turnover","vol_ratio","open","high","low","prev_close")
+            if c in df.columns]
+    df = df[keep].copy()
+    if "code" in df.columns:
+        df["code"] = df["code"].astype(str).str.zfill(6)
+    for col in ("price","chg_pct","amount","circ_mkt_cap","turnover","vol_ratio",
+                "open","high","low","prev_close"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+
 def get_realtime_quotes(codes: list = None) -> pd.DataFrame:
     """
     获取实时行情。
     ★ v3.4 性能优化：全市场行情（codes=None）启用全局缓存，TTL=55秒。
     同一轮扫描中多个子函数调用此函数只发送一次网络请求，大幅降低akshare请求频率。
     指定 codes（小列表）时绕过缓存，直接过滤缓存数据。
-    ★ v3.5 修复：主接口失败时自动切换新浪备用接口，两个接口均失败才使用缓存兜底，
-               彻底解决 RemoteDisconnected/Connection aborted 导致行情为空的问题。
+    ★ v3.6 修复：增加新浪第三接口（与东方财富完全独立数据源），
+               全部接口失败时扩大缓存容忍至 5 分钟（开盘瞬间短暂断连不影响扫描）。
     """
     global _realtime_cache, _realtime_cache_time
     import time as _time
@@ -873,10 +914,11 @@ def get_realtime_quotes(codes: list = None) -> pd.DataFrame:
         if not _realtime_cache.empty and (now_ts - _realtime_cache_time) < REALTIME_CACHE_TTL:
             return _realtime_cache.copy()
 
-    # 依次尝试主接口、备用接口
+    # 依次尝试：① akshare东财  ② push2直连  ③ akshare新浪（完全不同数据源）
     fetchers = [
         ("akshare(东方财富)", _fetch_spot_em),
         ("东方财富直连(大页串行)", _fetch_spot_em_backup),
+        ("新浪行情(独立数据源)", _fetch_spot_sina),
     ]
     last_error = None
     for source, fetcher in fetchers:
@@ -894,11 +936,16 @@ def get_realtime_quotes(codes: list = None) -> pd.DataFrame:
             log.warning(f"[行情] {source} 接口失败: {e}，尝试下一个接口...")
             _time.sleep(1)
 
-    # 全部接口失败 → 降级使用缓存
+    # 全部接口失败 → 降级使用缓存（容忍 5 分钟内的旧缓存，应对开盘瞬间短暂封锁）
     log.error(f"[行情] 所有接口均失败，最后错误: {last_error}")
+    _CACHE_FALLBACK_TTL = 300.0  # 5 分钟内旧缓存可降级使用
     if codes is None and not _realtime_cache.empty:
-        log.warning("[行情] 降级使用缓存数据")
-        return _realtime_cache.copy()
+        cache_age = now_ts - _realtime_cache_time
+        if cache_age < _CACHE_FALLBACK_TTL:
+            log.warning(f"[行情] 降级使用缓存数据（缓存年龄 {cache_age:.0f}s）")
+            return _realtime_cache.copy()
+        else:
+            log.error(f"[行情] 缓存已过期（{cache_age:.0f}s > {_CACHE_FALLBACK_TTL}s），返回空数据")
     return pd.DataFrame()
 
 def get_hist_kline(code: str, days: int = 60) -> pd.DataFrame:
