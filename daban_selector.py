@@ -3801,7 +3801,7 @@ def scan_intraday_dip() -> list:
                 if chg_pct <= -0.095:
                     continue
 
-                zt_price    = round(prev_c * 1.10, 2)    # 今日涨停价
+                zt_price    = calc_zt_price_by_code(prev_c, code)   # 今日涨停价（区分创业板/北交所）
                 max_chg     = (high_p - prev_c) / prev_c if prev_c > 0 else 0
                 dist_to_zt  = (price - zt_price) / zt_price if zt_price > 0 else 0
                 intra_high  = high_p
@@ -5213,7 +5213,7 @@ def scan_pullback_and_bomb() -> list:
                 max_chg    = (high_p - prev_c) / prev_c
                 fall_from_hi = (price - high_p) / high_p
 
-                zt_price   = round(prev_c * 1.10, 2)
+                zt_price   = calc_zt_price_by_code(prev_c, code)   # 按板块计算涨停价
 
                 # ── 类型1：冲高回落 ─────────────────────────────────
                 if (max_chg >= PULLBACK_HIGH_THRESH and
@@ -5260,7 +5260,13 @@ def scan_pullback_and_bomb() -> list:
                 # 获取昨日涨停池中炸板的（今日开盘跌幅大的）
                 yest_codes = list(yesterday_zt_df[zt_col].astype(str).str.zfill(6))
                 if yest_codes:
-                    rt2 = get_realtime_quotes(yest_codes[:50])  # 限制数量
+                    # ★ 优先从全市场缓存中直接过滤，避免重新发起网络请求（原 get_realtime_quotes(codes)
+                    #   传入 codes 参数会绕过缓存，对昨日28+只逐只请求 → 产生大量重复日志）
+                    _full_rt = get_realtime_quotes()   # 命中缓存，零开销
+                    _yest_set = set(yest_codes[:50])
+                    rt2 = _full_rt[_full_rt["code"].isin(_yest_set)].reset_index(drop=True) \
+                          if not _full_rt.empty and "code" in _full_rt.columns \
+                          else pd.DataFrame()
                     for _, row2 in rt2.iterrows():
                         try:
                             code2  = str(row2.get("code", "")).zfill(6)
@@ -5703,7 +5709,7 @@ def scan_midway_surge() -> list:
                 # 涨跌幅
                 chg = (price - prev_c) / prev_c
                 # 过滤：涨停 / 跌停
-                zt_p = calc_zt_price(prev_c)
+                zt_p = calc_zt_price_by_code(prev_c, code)
                 if price >= zt_p * 0.999:
                     continue  # 已涨停，走打板逻辑
                 if chg <= -0.095:
@@ -5918,12 +5924,8 @@ def scan_pre_zt() -> list:
                 if open_p > 0 and open_chg < PRE_ZT_OPEN_CHG_MIN:
                     continue
 
-                # ── 理论涨停价 ────────────────────────────────────────────
-                # 创业板300xxx/301xxx 涨停20%
-                if code.startswith("300") or code.startswith("301"):
-                    zt_price = round(prev_c * 1.20, 2)
-                else:
-                    zt_price = round(prev_c * 1.10, 2)
+                # ── 理论涨停价（按板块：创业板/科创板+20%，北交所+30%，主板+10%）────
+                zt_price = calc_zt_price_by_code(prev_c, code)
                 gap_pct = (zt_price - price) / price * 100   # 距涨停还差X%（利润空间上界）
 
                 # ── 拉升特征标签 ──────────────────────────────────────────
@@ -6703,11 +6705,11 @@ def main():
                         return s.score + {"连板": s.connect_days * 8, "首板": 5,
                                           "竞价": 3, "反包": 2}.get(s.strategy, 0)
                     top = sorted(signals_925, key=_sort, reverse=True)[:10]
+                    log.info(f"9:25 扫描到 {len(top)} 只信号（过滤后可能减少），开始推送...")
                     push_signals(top, "opening", emotion_925)
                     for s in top:
                         PUSHED_TODAY.add(s.code)
                     all_day_signals.extend([s for s in top if s.code not in {x.code for x in all_day_signals}])
-                    log.info(f"9:25 强制推送 {len(top)} 只")
                 else:
                     emo_info = ""
                     if emotion_925:
