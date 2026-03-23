@@ -860,22 +860,23 @@ def _fetch_spot_em_backup() -> pd.DataFrame:
 def _txzq_build_fallback_codes() -> list:
     """
     规则生成全市场A股代码列表（完全离线，不依赖任何网络请求）。
-    覆盖范围：沪市主板/科创板 + 深市主板/中小板/创业板/北交所，约5500个代码。
-    腾讯接口对无效代码返回空数据行（不报错），多发送几百个无效代码无任何影响。
+    只枚举真实存在的号段，约6200个，减少无效请求批次。
+    腾讯接口对无效代码返回空数据行（不报错），少量无效代码无影响。
     """
     codes = []
-    # 沪市主板：600000-609999
-    codes += [f"{i:06d}" for i in range(600000, 610000)]
-    # 沪市科创板：688000-689999
-    codes += [f"{i:06d}" for i in range(688000, 690000)]
-    # 深市主板/中小板：000001-002999
-    codes += [f"{i:06d}" for i in range(1, 3000)]
-    # 深市创业板：300001-301999
-    codes += [f"{i:06d}" for i in range(300001, 302000)]
-    # 北交所：830000-839999、430000-439999、920000-929999
-    codes += [f"{i:06d}" for i in range(830000, 840000)]
-    codes += [f"{i:06d}" for i in range(430000, 440000)]
-    codes += [f"{i:06d}" for i in range(920000, 930000)]
+    # 沪市主板：600000-606999（实际上市到约6069xx）
+    codes += [f"{i:06d}" for i in range(600000, 607000)]
+    # 沪市科创板：688000-688999
+    codes += [f"{i:06d}" for i in range(688000, 689000)]
+    # 深市主板：000001-000999
+    codes += [f"{i:06d}" for i in range(1, 1000)]
+    # 深市中小板：001000-002999（含001xxx、002xxx）
+    codes += [f"{i:06d}" for i in range(1000, 3000)]
+    # 深市创业板：300001-301599
+    codes += [f"{i:06d}" for i in range(300001, 301600)]
+    # 北交所：830000-835999、920000-920999
+    codes += [f"{i:06d}" for i in range(830000, 836000)]
+    codes += [f"{i:06d}" for i in range(920000, 921000)]
     return codes
 
 
@@ -912,7 +913,8 @@ def _fetch_spot_txzq() -> pd.DataFrame:
         except Exception as e:
             log.warning(f"[腾讯行情] akshare 代码列表获取失败（{e}），改用离线规则生成")
             all_codes = _txzq_build_fallback_codes()
-            log.info(f"[腾讯行情] 离线规则生成代码 {len(all_codes)} 个（含无效代码，腾讯接口自动忽略）")
+            _TXZQ_CODES_CACHE = all_codes   # 离线生成同样写入缓存，避免下次重复生成
+            log.info(f"[腾讯行情] 离线规则生成代码 {len(all_codes)} 个（已缓存）")
 
     if not all_codes:
         raise ValueError("全市场代码列表为空")
