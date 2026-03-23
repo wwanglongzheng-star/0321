@@ -855,40 +855,94 @@ def _fetch_spot_em_backup() -> pd.DataFrame:
     return _em_build_df(all_rows)
 
 
-def _fetch_spot_sina() -> pd.DataFrame:
+def _fetch_spot_txzq() -> pd.DataFrame:
     """
-    第三接口：akshare stock_zh_a_spot()，数据来源为新浪财经，
-    与东方财富完全独立，东方财富封锁时的终极备用。
-    新浪行情字段较少（无流通市值/量比），用 NaN 补全缺失列。
+    第三接口：腾讯证券行情直连（qt.gtimg.cn），与东方财富/新浪完全独立的第三数据源。
+    腾讯行情接口反爬宽松，开盘高峰期稳定性强。
+    每批150个股票代码，串行请求（全市场约5000只，约34批）。
+
+    腾讯返回格式（GBK编码）：
+      v_sh600000="1~浦发银行~600000~现价~昨收~今开~最高~最低~买一~卖一~成交量~成交额(万元)~...~涨跌幅~换手率~...";
+    字段索引（0-based，~分割）：
+      [0]=标志  [1]=名称  [2]=代码  [3]=现价  [4]=昨收  [5]=今开
+      [6]=最高  [7]=最低  [11]=成交额(万元)  [34]=涨跌幅  [37]=换手率
     """
-    df = ak.stock_zh_a_spot()
-    if df is None or df.empty:
-        raise ValueError("stock_zh_a_spot(新浪) 返回空数据")
-    # 新浪列名映射
-    col_map = {
-        "代码":     "code",
-        "名称":     "name",
-        "最新价":   "price",
-        "涨跌幅":   "chg_pct",
-        "成交额":   "amount",
-        "换手率":   "turnover",
-        "今开":     "open",
-        "最高":     "high",
-        "最低":     "low",
-        "昨收":     "prev_close",
-        # 新浪不直接提供这两列，下面补 NaN
+    import re as _re
+    import time as _t
+
+    # 1. 获取全市场代码列表
+    try:
+        code_df = ak.stock_info_a_code_name()
+        all_codes = code_df["code"].astype(str).str.zfill(6).tolist()
+    except Exception as e:
+        raise ValueError(f"获取股票代码列表失败: {e}")
+
+    if not all_codes:
+        raise ValueError("全市场代码列表为空")
+
+    # 2. 腾讯行情接口：sh/sz前缀 + 代码批量查询
+    def _code_to_txsym(c: str) -> str:
+        return ("sh" if c.startswith(("6", "9")) else "sz") + c
+
+    _TX_URL = "https://qt.gtimg.cn/q={}"
+    _TX_HEADERS = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer":    "https://gu.qq.com/",
+        "Accept":     "text/plain,*/*",
     }
-    df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
-    # 补全东方财富有但新浪没有的列
-    for missing_col in ("circ_mkt_cap", "vol_ratio"):
-        if missing_col not in df.columns:
-            df[missing_col] = float("nan")
-    keep = [c for c in ("code","name","price","chg_pct","amount","circ_mkt_cap",
-                         "turnover","vol_ratio","open","high","low","prev_close")
-            if c in df.columns]
-    df = df[keep].copy()
-    if "code" in df.columns:
-        df["code"] = df["code"].astype(str).str.zfill(6)
+    # 匹配每只股票的数据行：v_sh000001="..." 或 v_sz000001="..."
+    _LINE_RE = _re.compile(r'v_\w+="([^"]+)"')
+
+    def _safe_float(s: str) -> float:
+        try:
+            return float(s) if s.strip() else float("nan")
+        except ValueError:
+            return float("nan")
+
+    _BATCH = 150
+    all_rows = []
+    sess = _em_make_session(_TX_HEADERS)
+    try:
+        for i in range(0, len(all_codes), _BATCH):
+            batch = all_codes[i: i + _BATCH]
+            syms  = ",".join(_code_to_txsym(c) for c in batch)
+            try:
+                r = sess.get(_TX_URL.format(syms), timeout=15)
+                r.encoding = "gbk"
+                text = r.text
+            except Exception:
+                _t.sleep(0.2)
+                continue
+            for m in _LINE_RE.finditer(text):
+                f = m.group(1).split("~")
+                if len(f) < 38:
+                    continue
+                code = f[2].zfill(6) if f[2] else ""
+                if not code:
+                    continue
+                all_rows.append({
+                    "code":         code,
+                    "name":         f[1],
+                    "price":        _safe_float(f[3]),
+                    "prev_close":   _safe_float(f[4]),
+                    "open":         _safe_float(f[5]),
+                    "high":         _safe_float(f[6]),   # [6]=最高
+                    "low":          _safe_float(f[7]),   # [7]=最低
+                    "amount":       _safe_float(f[11]) * 10000,  # [11]=成交额(万元)→元
+                    "chg_pct":      _safe_float(f[34]),  # [34]=涨跌幅%
+                    "turnover":     _safe_float(f[37]),  # [37]=换手率%
+                    "circ_mkt_cap": float("nan"),        # 腾讯接口无此字段
+                    "vol_ratio":    float("nan"),        # 腾讯接口无此字段
+                })
+            if i + _BATCH < len(all_codes):
+                _t.sleep(0.05)   # 50ms 间隔，避免触发限流
+    finally:
+        sess.close()
+
+    if not all_rows:
+        raise ValueError("腾讯行情接口返回空数据")
+
+    df = pd.DataFrame(all_rows)
     for col in ("price","chg_pct","amount","circ_mkt_cap","turnover","vol_ratio",
                 "open","high","low","prev_close"):
         if col in df.columns:
@@ -902,7 +956,7 @@ def get_realtime_quotes(codes: list = None) -> pd.DataFrame:
     ★ v3.4 性能优化：全市场行情（codes=None）启用全局缓存，TTL=55秒。
     同一轮扫描中多个子函数调用此函数只发送一次网络请求，大幅降低akshare请求频率。
     指定 codes（小列表）时绕过缓存，直接过滤缓存数据。
-    ★ v3.6 修复：增加新浪第三接口（与东方财富完全独立数据源），
+    ★ v3.6 修复：增加腾讯证券第三接口（与东方财富完全独立数据源），
                全部接口失败时扩大缓存容忍至 5 分钟（开盘瞬间短暂断连不影响扫描）。
     """
     global _realtime_cache, _realtime_cache_time
@@ -914,11 +968,11 @@ def get_realtime_quotes(codes: list = None) -> pd.DataFrame:
         if not _realtime_cache.empty and (now_ts - _realtime_cache_time) < REALTIME_CACHE_TTL:
             return _realtime_cache.copy()
 
-    # 依次尝试：① akshare东财  ② push2直连  ③ akshare新浪（完全不同数据源）
+    # 依次尝试：① akshare东财  ② push2直连  ③ 腾讯证券（完全不同数据源）
     fetchers = [
         ("akshare(东方财富)", _fetch_spot_em),
         ("东方财富直连(大页串行)", _fetch_spot_em_backup),
-        ("新浪行情(独立数据源)", _fetch_spot_sina),
+        ("腾讯证券(独立数据源)", _fetch_spot_txzq),
     ]
     last_error = None
     for source, fetcher in fetchers:
