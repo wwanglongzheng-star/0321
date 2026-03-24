@@ -6907,47 +6907,6 @@ def main():
                 time.sleep(10 if _has_tboard_this_round else 20)
             else:
                 log.info(f"无新信号，已推送 {len(PUSHED_TODAY)} 只")
-                # ★ v3.1：每整点心跳推送（确认系统在线 + 市场状态）
-                # 推送时间：10:00 / 11:00 / 14:00（避免9:25和14:30附近重复）
-                if phase in ("morning", "afternoon") and now.minute == 0:
-                    hr = now.hour
-                    if hr in (10, 11, 14) and hr not in _HEARTBEAT_PUSHED_HOURS:
-                        _HEARTBEAT_PUSHED_HOURS.add(hr)
-                        emo   = emotion if emotion else get_market_emotion()
-                        zt_c  = emo.get("zt_count", 0)
-                        dt_c  = emo.get("dt_count", 0)
-                        emo_s = emo.get("emotion", "未知")
-                        ms    = market.get("market_state", "")
-                        il    = market.get("index_line", "")
-                        # ★ v3.4：心跳加入今日已推信号的实时状态跟踪
-                        top_track = ""
-                        if all_day_signals:
-                            rt_snap = get_realtime_quotes()
-                            rt_map  = {}
-                            if not rt_snap.empty:
-                                for _, _r in rt_snap.iterrows():
-                                    rt_map[str(_r.get("code","")).zfill(6)] = _r
-                            track_lines = []
-                            for _s in sorted(all_day_signals, key=lambda x: x.score, reverse=True)[:3]:
-                                _rt = rt_map.get(_s.code)
-                                if _rt is not None:
-                                    _now_p  = float(_rt.get("price", _s.price) or _s.price)
-                                    _chg    = (_now_p - _s.entry_price) / _s.entry_price if _s.entry_price > 0 else 0
-                                    _icon   = "📈" if _chg > 0 else ("📉" if _chg < 0 else "➡️")
-                                    track_lines.append(
-                                        f"  {_icon}{_s.name}({_s.strategy}) 入场{_s.entry_price:.2f}→现价{_now_p:.2f}({_chg:+.1%})"
-                                    )
-                            if track_lines:
-                                top_track = "\n\n**今日信号跟踪（TOP3）**：\n" + "\n".join(track_lines)
-                        send_wx(
-                            f"💓打板系统在线({hr}:00)",
-                            f"**{hr}:00 系统心跳 | 正常运行中**\n\n"
-                            f"大盘：{ms} | {il}\n"
-                            f"市场情绪：{emo_s}（涨停{zt_c}家/跌停{dt_c}家）\n\n"
-                            f"今日已推送信号：{len(PUSHED_TODAY)}只"
-                            f"{top_track}\n\n"
-                            f"持续监控中，有信号立即推送..."
-                        )
                 # ★ v5.0 sleep 自适应：T字板10s，竞价阶段45s，盘中60s（从90s压缩）
                 if _has_tboard_this_round:
                     time.sleep(10)   # T字板分秒必争
@@ -6955,6 +6914,49 @@ def main():
                     time.sleep(45)
                 else:
                     time.sleep(60)   # 普通盘中从90s压缩到60s
+
+            # ★ v3.1：每整点心跳推送（确认系统在线 + 市场状态）
+            # ★ fix：从 else 分支移出，独立执行，避免整点恰好有信号时心跳被跳过
+            # 推送时间：10:00 / 11:00 / 14:00（避免9:25和14:30附近重复）
+            if phase in ("morning", "afternoon") and now.minute <= 1:
+                hr = now.hour
+                if hr in (10, 11, 14) and hr not in _HEARTBEAT_PUSHED_HOURS:
+                    _HEARTBEAT_PUSHED_HOURS.add(hr)
+                    emo   = emotion if emotion else get_market_emotion()
+                    zt_c  = emo.get("zt_count", 0)
+                    dt_c  = emo.get("dt_count", 0)
+                    emo_s = emo.get("emotion", "未知")
+                    ms    = market.get("market_state", "")
+                    il    = market.get("index_line", "")
+                    # ★ v3.4：心跳加入今日已推信号的实时状态跟踪
+                    top_track = ""
+                    if all_day_signals:
+                        rt_snap = get_realtime_quotes()
+                        rt_map  = {}
+                        if not rt_snap.empty:
+                            for _, _r in rt_snap.iterrows():
+                                rt_map[str(_r.get("code","")).zfill(6)] = _r
+                        track_lines = []
+                        for _s in sorted(all_day_signals, key=lambda x: x.score, reverse=True)[:3]:
+                            _rt = rt_map.get(_s.code)
+                            if _rt is not None:
+                                _now_p  = float(_rt.get("price", _s.price) or _s.price)
+                                _chg    = (_now_p - _s.entry_price) / _s.entry_price if _s.entry_price > 0 else 0
+                                _icon   = "📈" if _chg > 0 else ("📉" if _chg < 0 else "➡️")
+                                track_lines.append(
+                                    f"  {_icon}{_s.name}({_s.strategy}) 入场{_s.entry_price:.2f}→现价{_now_p:.2f}({_chg:+.1%})"
+                                )
+                        if track_lines:
+                            top_track = "\n\n**今日信号跟踪（TOP3）**：\n" + "\n".join(track_lines)
+                    send_wx(
+                        f"💓打板系统在线({hr}:00)",
+                        f"**{hr}:00 系统心跳 | 正常运行中**\n\n"
+                        f"大盘：{ms} | {il}\n"
+                        f"市场情绪：{emo_s}（涨停{zt_c}家/跌停{dt_c}家）\n\n"
+                        f"今日已推送信号：{len(PUSHED_TODAY)}只"
+                        f"{top_track}\n\n"
+                        f"持续监控中，有信号立即推送..."
+                    )
 
         except KeyboardInterrupt:
             log.info("手动中断，退出")
