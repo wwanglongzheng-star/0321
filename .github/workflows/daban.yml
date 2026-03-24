@@ -38,10 +38,13 @@ jobs:
     runs-on: ubuntu-latest
     # 08:50 启动 → 15:35 收盘 = 6.75h = 405min + 环境准备 10min
     timeout-minutes: 420
-    # ★ 并发控制：每次触发独立运行，互不干扰（用 run_id 保证唯一）
-    # 手动触发/cron 触发都各自独立，不会互相 cancel 或排队阻塞
+    # ★ 并发控制：固定 group，同一时间只允许一个进程运行
+    # cancel-in-progress: false → 后续 cron（09:10/09:30）进入排队等待
+    #   若 08:50 主 cron 正常启动，09:10/09:30 排队等待其完成后才执行
+    #   此时已 15:xx 收盘，排队的进程会立刻检测到 closed 阶段并退出，不产生重复推送
+    #   若 08:50 主 cron 延迟/未触发，09:10/09:30 直接获得锁并正常运行全天
     concurrency:
-      group: daban-${{ github.run_id }}
+      group: daban-daily
       cancel-in-progress: false
 
     steps:
