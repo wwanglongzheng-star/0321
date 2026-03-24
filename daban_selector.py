@@ -1386,12 +1386,21 @@ def get_realtime_quotes(codes: list = None) -> pd.DataFrame:
     return pd.DataFrame()
 
 def get_hist_kline(code: str, days: int = 60) -> pd.DataFrame:
-    """获取历史日线（带炸板统计字段）"""
+    """获取历史日线（带炸板统计字段），单次请求超时8s自动跳过"""
+    import concurrent.futures
     try:
         start = (beijing_now() - datetime.timedelta(days=days * 2)).strftime("%Y%m%d")
         end   = beijing_now().strftime("%Y%m%d")
-        df = ak.stock_zh_a_hist(symbol=code[:6], period="daily",
-                                 start_date=start, end_date=end, adjust="qfq")
+        def _fetch():
+            return ak.stock_zh_a_hist(symbol=code[:6], period="daily",
+                                      start_date=start, end_date=end, adjust="qfq")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            fut = ex.submit(_fetch)
+            try:
+                df = fut.result(timeout=8)
+            except concurrent.futures.TimeoutError:
+                log.debug(f"{code} 历史数据超时(8s)，跳过")
+                return pd.DataFrame()
         if df is None or len(df) < 10:
             return pd.DataFrame()
         df = df.tail(days).reset_index(drop=True)
@@ -3068,6 +3077,7 @@ def scan_zt_pullback() -> list:
       6. 均线未破坏（MA5不能低于MA20×95%，趋势基本完整）
     """
     signals = []
+    _scan_start = time.time()
     try:
         realtime = get_realtime_quotes()
         if realtime.empty:
@@ -3103,6 +3113,10 @@ def scan_zt_pullback() -> list:
                 # 今日本身是涨停/跌停，不做回调策略
                 if abs(chg_pct) >= 0.095:
                     continue
+                # ★ 整体扫描超时保护：45s内未完成则停止遍历，避免卡死主循环
+                if time.time() - _scan_start > 45:
+                    log.debug("scan_zt_pullback 超时(45s)，提前结束遍历")
+                    break
 
                 # ── 获取历史数据（需要60日以找到涨停点） ─────────
                 hist = get_hist_kline(code, 60)
@@ -3378,6 +3392,7 @@ def scan_washout_dip() -> list:
       - ST股/科创板/北交所
     """
     signals = []
+    _scan_start = time.time()
     try:
         realtime = get_realtime_quotes()
         if realtime.empty:
@@ -3414,6 +3429,10 @@ def scan_washout_dip() -> list:
                 # 涨跌停股不做洗盘判断（今日已涨停/跌停）
                 if abs(chg_pct) >= 0.095:
                     continue
+                # ★ 整体扫描超时保护：45s内未完成则停止遍历，避免卡死主循环
+                if time.time() - _scan_start > 45:
+                    log.debug("scan_washout_dip 超时(45s)，提前结束遍历")
+                    break
 
                 # ── 获取历史数据（60日） ───────────────────────────
                 hist = get_hist_kline(code, 60)
@@ -4833,6 +4852,7 @@ def scan_lower_shadow() -> list:
     昨日：从历史日线数据识别昨日长下影线（趋势延续判断）
     """
     signals = []
+    _scan_start = time.time()
     try:
         realtime = get_realtime_quotes()
         if realtime.empty:
@@ -4868,6 +4888,10 @@ def scan_lower_shadow() -> list:
                     continue
                 if circ < MIN_MKT_CAP or circ > MAX_MKT_CAP:
                     continue
+                # ★ 整体扫描超时保护：45s内未完成则停止遍历，避免卡死主循环
+                if time.time() - _scan_start > 45:
+                    log.debug("scan_lower_shadow 超时(45s)，提前结束遍历")
+                    break
 
                 # 获取历史数据（60日）
                 hist = get_hist_kline(code, 65)
