@@ -1,0 +1,39 @@
+name: Keep Alive（防止仓库被冻结）
+
+# ─────────────────────────────────────────────────────────────────
+# GitHub 规则：仓库连续 60 天无任何 commit/push，schedule 会被自动暂停。
+# 本 workflow 每周日 UTC 08:00（北京时间 16:00）自动提交一次空 commit，
+# 保持仓库活跃，确保主 workflow 的 cron 不被冻结。
+# ─────────────────────────────────────────────────────────────────
+
+on:
+  schedule:
+    # 每周日 UTC 08:00 = 北京时间 16:00
+    - cron: "0 8 * * 0"
+  workflow_dispatch:  # 支持手动触发
+
+jobs:
+  keep-alive:
+    name: 保持仓库活跃
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    permissions:
+      contents: write  # 需要写权限才能 commit
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 写入心跳文件并提交
+        run: |
+          TIMESTAMP=$(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')
+          echo "Last keep-alive: $TIMESTAMP (CST)" > .github/keep_alive.txt
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .github/keep_alive.txt
+          # 只在文件有变化时才提交（避免空提交报错）
+          git diff --staged --quiet || git commit -m "chore: keep-alive $TIMESTAMP"
+          git push
