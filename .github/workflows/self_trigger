@@ -2,11 +2,19 @@ name: 每日自触发（强制启动主 workflow）
 
 # ─────────────────────────────────────────────────────────────────
 # 解决 GitHub Actions schedule 不可靠的核心方案：
-# 本 workflow 用三档 cron 调用 GitHub API 强制触发主 daban.yml，
-# 即使 daban.yml 自身的 cron 被 GitHub 延迟/冻结，也能保证每天准时启动。
+# 本 workflow 用三档 cron 调用 GitHub API 强制触发主 daban.yml。
 #
-# 原理：workflow_dispatch 触发 > schedule 触发（优先级更高，更可靠）
-# 依赖：仅使用 GITHUB_TOKEN（自动注入，无需手动配置任何 secret）
+# ⚠️ 重要：必须使用 PAT（Personal Access Token），而非 GITHUB_TOKEN。
+#    原因：GitHub 安全限制——GITHUB_TOKEN 触发的事件不会再触发其他 workflow，
+#          PAT 触发的 workflow_dispatch 则可以正常级联触发。
+#
+# 配置步骤（一次性，2分钟）：
+#   1. GitHub → 右上角头像 → Settings → Developer settings
+#      → Personal access tokens → Tokens (classic) → Generate new token
+#   2. Note 填：daban-trigger；Expiration 选：No expiration（或1年）
+#   3. 勾选权限：workflow（只需这一个）→ Generate token → 复制 token
+#   4. 回到本仓库 → Settings → Secrets and variables → Actions
+#      → New repository secret → Name: PAT_TRIGGER，Value: 粘贴 token → 保存
 # ─────────────────────────────────────────────────────────────────
 
 on:
@@ -25,36 +33,37 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
 
-    permissions:
-      actions: write   # 触发 workflow_dispatch 需要此权限
-
     steps:
-      - name: 通过 API 触发 daban.yml
+      - name: 通过 PAT 触发 daban.yml
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PAT_TOKEN: ${{ secrets.PAT_TRIGGER }}
         run: |
-          # 获取仓库信息
           REPO="${{ github.repository }}"
           echo "触发仓库: $REPO"
           echo "触发时间: $(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S CST')"
 
-          # 调用 GitHub API 触发 daban.yml 的 workflow_dispatch
+          # PAT 未配置时跳过（避免 workflow 报错）
+          if [ -z "$PAT_TOKEN" ]; then
+            echo "⚠️  PAT_TRIGGER secret 未配置，跳过触发。"
+            echo "请按照 workflow 注释中的步骤配置 PAT_TRIGGER secret。"
+            exit 0
+          fi
+
+          # 调用 GitHub API，用 PAT 触发 daban.yml 的 workflow_dispatch
           HTTP_CODE=$(curl -s -o /tmp/resp.json -w "%{http_code}" \
             -X POST \
             -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Authorization: Bearer $PAT_TOKEN" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
             "https://api.github.com/repos/$REPO/actions/workflows/daban.yml/dispatches" \
             -d '{"ref":"main","inputs":{"test_mode":"0","manual_trigger":"0"}}')
 
           echo "API 响应码: $HTTP_CODE"
-          cat /tmp/resp.json || true
+          cat /tmp/resp.json 2>/dev/null || true
 
-          # 204 = 触发成功（GitHub dispatch 成功返回 204 No Content）
           if [ "$HTTP_CODE" = "204" ]; then
             echo "✅ daban.yml 触发成功"
           else
             echo "❌ 触发失败，响应码: $HTTP_CODE"
-            # 不让本 workflow 失败，避免产生噪音通知
             exit 0
           fi
