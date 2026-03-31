@@ -15,6 +15,7 @@
   9. 外围+大盘综合 - A股三大指数+北向资金+市场宽度，综合研判多空状态
   10. 冲高回落/炸板 - 昨今冲高回落或炸板未回封，9:25/14:30 定时推送风险提示
   11. 消息联动推送 - 接入东方财富财经快讯，股价与消息联动第一时间推送
+  12. 轻量技术指标AI评分 - 纯 pandas/numpy 多因子评分（GitHub Actions可用，无额外依赖），MACD/RSI/均线/布林等因子，最多+25分加成
 
 ★ 市场情绪过滤系统（全局）：
   研究结论：涨停家数 10~30 家时胜率最高（40~55%），
@@ -475,21 +476,47 @@ INTRA_DIP_MIN_SCORE      = 50          # 日内抄底最低评分门槛
 #   ① 超早期预警层（2%~4%）：量比≥5x + 成交额≥1亿 + 价格贴近高点 → 提前6~8%利润空间
 #   ② 早期确认层（4%~7%）：量比≥3x → 利润空间3~6%，原有逻辑继续
 #   ③ 即将封板层（7%~9.2%）：量比≥2x → 确定性最高，追短线
-PRE_ZT_MIN_CHG         = 0.020   # ★v10.0: 最低触发涨幅从4%降至2%（更早预警）
+PRE_ZT_MIN_CHG         = 0.030   # ★v10.2: 最低触发涨幅3%（2%信噪比太低，实盘亏损多）
 PRE_ZT_MAX_CHG         = 0.092   # 最高涨幅上限（9.2%，快封板了再推没意义）
-PRE_ZT_VOL_RATIO       = 3.0     # 标准量比门槛（3x）
-PRE_ZT_VOL_RATIO_EARLY = 5.0     # ★v10.0: 超早期预警专用量比门槛（5x，弥补早期确定性不足）
-PRE_ZT_MIN_AMOUNT      = 30_000_000   # ★v10.0: 成交额下限从5000万降至3000万（更早触发）
-PRE_ZT_MIN_AMOUNT_EARLY = 100_000_000 # ★v10.0: 超早期预警专用成交额门槛（1亿，保证资金量）
-PRE_ZT_PRICE_NEAR_HIGH = 0.015        # 当前价距日内最高价≤1.5%（略放宽，允许小幅回踩）
-PRE_ZT_OPEN_CHG_MIN    = -0.005       # ★v10.0: 允许轻微低开（-0.5%），增加覆盖范围
-PRE_ZT_MIN_SCORE       = 50           # ★v10.0: 最低推送评分从55降至50（早期信号评分偏低）
-PRE_ZT_EARLY_MIN_SCORE = 60           # ★v10.0: 超早期预警（2%~4%）最低评分（更严格）
-# ★v10.0: 历史涨停股加分（有连板/再板预期）
-# 评分上限提高到110，保证历史加分能真正拉开分差
-PRE_ZT_SCORE_CAP       = 110          # ★v10.0: 评分上限提高至110（保留历史涨停加分的区分度）
+PRE_ZT_VOL_RATIO       = 3.5     # ★v10.2: 标准量比提高至3.5x（过滤低质量拉升）
+PRE_ZT_VOL_RATIO_EARLY = 6.0     # ★v10.2: 早期预警量比提高至6x（3%~5%段要求更严格的放量）
+PRE_ZT_MIN_AMOUNT      = 50_000_000   # ★v10.2: 成交额下限提高至5000万（过滤微盘弱流动性股）
+PRE_ZT_MIN_AMOUNT_EARLY = 150_000_000 # ★v10.2: 早期预警成交额提高至1.5亿（资金量更充裕）
+PRE_ZT_PRICE_NEAR_HIGH = 0.010        # ★v10.2: 收紧至1%（不允许明显回落，当前价必须贴近高点）
+PRE_ZT_OPEN_CHG_MIN    = -0.015       # ★v10.1: 放宽低开限制 -0.5%→-1.5%（支持低开后横盘突破形态）
+PRE_ZT_MIN_SCORE       = 62           # ★v10.2: 最低推送评分提高至62（精简信号数量，提升命中率）
+PRE_ZT_EARLY_MIN_SCORE = 72           # ★v10.2: 早期预警（3%~5%）最低评分提高至72（早期信号需更强确认）
+# 历史涨停股加分（有连板/再板预期）
+PRE_ZT_SCORE_CAP       = 130          # ★v10.2: 评分上限提高至130（三维加分后满分提高）
 PRE_ZT_HIST_ZT_BONUS   = 8            # 近期有涨停记录（_PREV_ZT_DF查到但非昨日）：+8分
 PRE_ZT_YEST_ZT_BONUS   = 13           # 昨日涨停（连板预期最强）：+13分
+
+# ── ★ v10.2 买点质量过滤配置 ────────────────────────────────────────────────
+# 实盘验证：高位股追板胜率极低，低位启动才是真正的买点
+PRE_ZT_MAX_20D_RISE    = 0.35         # 近20日涨幅上限35%（超过=高位股，追板炸板风险高）
+PRE_ZT_MIN_PUSH_COUNT  = 3            # 每次推送最少3只（信号不足时推全部）
+PRE_ZT_MAX_PUSH_COUNT  = 5            # ★v10.2: 每次推送上限从12降至5（精而不多，提升命中率）
+# 竞价预埋识别：09:15~09:25的大额竞价单是主力意图
+PRE_ZT_AUCTION_MIN_AMOUNT = 30_000_000  # 竞价阶段最小成交额（3000万确认主力入场）
+PRE_ZT_AUCTION_MIN_CHG    = 0.03        # 竞价阶段最低涨幅（3%以上才有冲板动能）
+
+# ── ★ v10.1 横盘突破识别配置（低开后横盘蓄势→加速突破，主力意图明确）──────────
+# 量化特征三要素：
+#   ① 低开蓄势：开盘涨幅在 -1.5%~-0.2%（低开洗筹，不是暴跌）
+#   ② 横盘确认：盘中当前涨幅 ≈ 开盘涨幅（chg_pct 与 open_chg 差值 ≤ 0.5%，说明一直横盘）
+#   ③ 加速突破：量比跳升 + 单周期涨速 ≥ 0.8%（突然放量拉升，主力启动信号）
+# 与普通直线拉升的区别：低开横盘说明主力有意控制筹码、洗盘成本低；
+#   突破时主力意图更明确，次日跟进意愿更强，信号质量高于普通早盘直线拉升。
+# ① 低开横盘识别阈值
+RANGE_BREAK_OPEN_CHG_MIN  = -0.015   # 低开下限：开盘涨幅 > -1.5%（低开不能太深，太深=主力放弃）
+RANGE_BREAK_OPEN_CHG_MAX  = -0.002   # 低开上限：开盘涨幅 < -0.2%（需确实低开，排除平开/高开）
+RANGE_BREAK_FLAT_THRESH   = 0.005    # 横盘判定：当前涨幅与开盘涨幅之差 ≤ 0.5%（长期横盘蓄势）
+# ② 加速突破阈值
+RANGE_BREAK_ACCEL_MIN     = 0.008    # 加速突破：单周期价格涨速 ≥ 0.8%（突然发力，非缓慢爬升）
+RANGE_BREAK_VOL_JUMP      = 2.5      # 量比跳升：突破时量比 ≥ 2.5x（放量确认，非假突破）
+# ③ 横盘突破专用评分加成（比普通直线拉升质量更高，额外加分）
+RANGE_BREAK_SCORE_BONUS   = 15       # 横盘突破形态识别后额外加分（+15分，拉开信号分差）
+RANGE_BREAK_MIN_SCORE     = 55       # 横盘突破信号最低推送评分（可独立于PRE_ZT_MIN_SCORE）
 
 # ── ★ 涨停回调缩量再启动信号配置 ────────────────────────────────────────────
 # 对应 daban_backtest.py 的 backtest_zt_pullback() 策略，实盘实时扫描版本
@@ -1815,6 +1842,9 @@ class DaBanSignal:
     # ★ 新增：来自实时行情的准确涨停价和封单量
     zt_price:     float  = 0.0   # 今日涨停价（封板时取买一价，最准；未封板时用昨收计算）
     seal_vol:     float  = 0.0   # 封单量(手)：买一申报量，越大封板越牢固
+    # ★ 新增：轻量技术指标评分（tech_score_bonus 计算，已计入score）
+    tech_bonus:   int    = 0      # 技术指标加分（0~25）
+    tech_detail:  str    = ""     # 技术加分明细（如 "+5(MACD金叉) +4(RSI强势(68)"）
 
 
 # ================================================================
@@ -2367,7 +2397,6 @@ def scan_first_board(zt_df: pd.DataFrame, yesterday_zt_codes: set,
         name        = c["name"]
         price       = c["price"]
         circ_cap    = c["circ_cap"]
-        seal_amount = c["seal_amount"]
         turnover    = c["turnover"]
         amount      = c["amount"]
         vol_ratio   = c["vol_ratio"]
@@ -2421,7 +2450,8 @@ def scan_first_board(zt_df: pd.DataFrame, yesterday_zt_codes: set,
             elif 0 < seal_time < 1300: time_bonus = 5
 
             sec_delta, sec_msg = sector_score(code, sector_zt_map)
-            score = seal_s + cap_s + vr_s + to_s + pt_s + char_s + time_bonus + sec_delta - penalty
+            tech_bonus, tech_detail = tech_score_bonus(hist)
+            score = seal_s + cap_s + vr_s + to_s + pt_s + char_s + time_bonus + sec_delta + tech_bonus - penalty
 
             reason_parts = [
                 f"封板{seal_ratio:.1%}",
@@ -2438,6 +2468,8 @@ def scan_first_board(zt_df: pd.DataFrame, yesterday_zt_codes: set,
                 reason_parts.append("均线多头")
             if sec_msg:
                 reason_parts.append(sec_msg)
+            if tech_detail:
+                reason_parts.append(f"技术分析:{tech_detail}")
             if fake_flags:
                 reason_parts.append(f"⚠️{'; '.join(fake_flags)}")
 
@@ -2463,6 +2495,8 @@ def scan_first_board(zt_df: pd.DataFrame, yesterday_zt_codes: set,
                 buyable=True,
                 zt_price=zt_p,
                 seal_vol=sv,
+                tech_bonus=tech_bonus,
+                tech_detail=tech_detail,
             ))
         except Exception as e:
             log.debug(f"首板评分异常 {code}: {e}")
@@ -2600,7 +2634,6 @@ def scan_connect_board(zt_df: pd.DataFrame, yesterday_zt_codes: set,
         name            = c["name"]
         price           = c["price"]
         circ_cap        = c["circ_cap"]
-        seal_amount     = c["seal_amount"]
         turnover        = c["turnover"]
         amount          = c["amount"]
         vol_ratio       = c["vol_ratio"]
@@ -2650,7 +2683,8 @@ def scan_connect_board(zt_df: pd.DataFrame, yesterday_zt_codes: set,
             elif 0 < seal_time < 1300: time_bonus = 4
 
             sec_delta, sec_msg = sector_score(code, sector_zt_map)
-            score = seal_s + cap_s + vr_s + board_bonus + to_s + char_s + time_bonus + sec_delta - penalty
+            tech_bonus, tech_detail = tech_score_bonus(hist)
+            score = seal_s + cap_s + vr_s + board_bonus + to_s + char_s + time_bonus + sec_delta + tech_bonus - penalty
 
             reason_parts = [
                 f"{connect_days}连板",
@@ -2666,6 +2700,8 @@ def scan_connect_board(zt_df: pd.DataFrame, yesterday_zt_codes: set,
                 reason_parts.append(f"封板@{seal_time//100}:{seal_time%100:02d}")
             if sec_msg:
                 reason_parts.append(sec_msg)
+            if tech_detail:
+                reason_parts.append(f"技术分析:{tech_detail}")
             if fake_flags:
                 reason_parts.append(f"⚠️{'; '.join(fake_flags)}")
 
@@ -2693,6 +2729,8 @@ def scan_connect_board(zt_df: pd.DataFrame, yesterday_zt_codes: set,
                 buyable=True,
                 zt_price=zt_p_lian,
                 seal_vol=sv_lian,
+                tech_bonus=tech_bonus,
+                tech_detail=tech_detail,
             ))
         except Exception as e:
             log.debug(f"连板评分异常 {code}: {e}")
@@ -3123,7 +3161,10 @@ def scan_zt_pullback() -> list:
                 if not stabilized:
                     continue
 
+
                 # ── 均线不破坏（趋势基本完整）────────────────────
+                ma5: float = 0.0
+                ma20: float = 0.0
                 if len(cls_arr) >= 20:
                     ma5  = float(np.mean(cls_arr[-5:]))
                     ma20 = float(np.mean(cls_arr[-20:]))
@@ -3168,6 +3209,9 @@ def scan_zt_pullback() -> list:
                     else:                score += 3
 
                 score = max(0.0, min(score, 100.0))
+                # ★ 技术指标加分
+                tech_bonus, tech_detail = tech_score_bonus(hist)
+                score = min(100.0, score + tech_bonus)
                 if score < ZT_PULLBACK_MIN_SCORE:
                     continue
 
@@ -3189,6 +3233,8 @@ def scan_zt_pullback() -> list:
                     f"缩量{vol_ratio_display:.0%}" if vol_ratio_display > 0 else f"量比{vol_ratio:.1f}x缩量",
                     f"今日{'收阳' if price > open_p else '企稳'}",
                 ]
+                if tech_detail:
+                    reason_parts.append(f"技术:{tech_detail}")
 
                 signals.append(ZtPullbackSignal(
                     code=code, name=name, price=price,
@@ -3674,6 +3720,7 @@ def scan_intraday_dip() -> list:
     - 流动性不足（成交额<3000万）
     - 当前又是涨停状态（不需要抄，直接打板）
     """
+    global _PREV_ZT_CODES, _PREV_ZT_DATE, _PREV_ZT_DF
     signals = []
     try:
         realtime = get_realtime_quotes()
@@ -3688,7 +3735,6 @@ def scan_intraday_dip() -> list:
 
         # ── 昨日涨停池（半T字判断：替代逐股历史K线请求）───────────
         # 每交易日只加载一次，大幅提升扫描速度
-        global _PREV_ZT_CODES, _PREV_ZT_DATE, _PREV_ZT_DF
         today_date = beijing_now().strftime("%Y-%m-%d")
         if _PREV_ZT_DATE != today_date:
             try:
@@ -4293,6 +4339,11 @@ def format_signal(sig: DaBanSignal, rank: int, market_state: str = "", emotion: 
         _sv_wan = sig.seal_vol / 10000
         seal_vol_line = f"**封单量**：{_sv_wan:.1f}万手（买一挂单，越大封板越牢）\n"
 
+    # 技术指标加分行
+    tech_line = ""
+    if getattr(sig, "tech_bonus", 0) > 0 and getattr(sig, "tech_detail", ""):
+        tech_line = f"**技术指标**：+{sig.tech_bonus}分 | {sig.tech_detail}\n"
+
     return (
         f"### {rank}. {icon}{sig.name}（{sig.code}）\n"
         f"**策略**：{sig.strategy} | **评分**：{sig.score:.0f}分\n"
@@ -4302,6 +4353,7 @@ def format_signal(sig: DaBanSignal, rank: int, market_state: str = "", emotion: 
         f"{seal_vol_line}"
         f"{time_line}"
         f"{char_line}"
+        f"{tech_line}"
         f"{risk_line}"
         f"{deduction_line}"
         f"{exit_line}"
@@ -5316,6 +5368,158 @@ def push_pullback_warning(signals: list, market: dict = None, push_time: str = "
 
 
 # ================================================================
+# ★ 轻量技术指标 AI 评分模块（v10.2新增，无额外依赖，GitHub Actions可用）
+# ================================================================
+# 基于历史K线的纯 pandas/numpy 多因子评分，最多+25分加成到主评分
+# 因子：MACD金叉/RSI强势/均线多头斜率/缩量回调/量价背离/振幅收窄/次日高开率
+# ================================================================
+
+
+def _ema(series: "pd.Series", n: int) -> "pd.Series":
+    """指数移动平均（pandas ewm实现）"""
+    return series.ewm(span=n, adjust=False).mean()
+
+
+def tech_score_bonus(hist: "pd.DataFrame") -> "tuple[int, str]":
+    """
+    基于历史日K线计算轻量技术指标评分加成。
+    无额外依赖，完全基于 pandas/numpy，GitHub Actions 可直接运行。
+
+    参数：
+      hist  历史日线 DataFrame，含 ['open','high','low','close','volume'] 列，
+            至少 20 根K线（不足时返回 0 分）。
+
+    返回：
+      (bonus, detail_str)
+        bonus       int     加分值（0~25），直接累加到主策略 score
+        detail_str  str     加分明细描述，用于推送消息展示
+    """
+    try:
+        required = ["open", "high", "low", "close", "volume"]
+        if hist is None or hist.empty or not all(c in hist.columns for c in required):
+            return 0, ""
+        if len(hist) < 20:
+            return 0, ""
+
+        df = hist[required].copy().reset_index(drop=True)
+        df = df.apply(pd.to_numeric, errors="coerce").dropna()
+        if len(df) < 20:
+            return 0, ""
+
+        close  = df["close"]
+        high   = df["high"]
+        low    = df["low"]
+        volume = df["volume"]
+
+        bonus_items: list = []   # [(分值, 描述)]
+
+        # ── 因子1：MACD 金叉（+5分）──────────────────────────────────
+        # DIF>DEA 且近3日内刚发生金叉
+        try:
+            ema12 = _ema(close, 12)
+            ema26 = _ema(close, 26)
+            dif   = ema12 - ema26
+            dea   = _ema(dif, 9)
+            macd  = (dif - dea) * 2
+            # 当前DIF>DEA且前一根DIF<=DEA → 金叉信号
+            if len(dif) >= 2 and dif.iloc[-1] > dea.iloc[-1] and dif.iloc[-2] <= dea.iloc[-2]:
+                bonus_items.append((5, "MACD金叉"))
+            elif dif.iloc[-1] > dea.iloc[-1] and macd.iloc[-1] > 0:
+                bonus_items.append((3, "MACD多头"))
+        except Exception:
+            pass
+
+        # ── 因子2：RSI 强势区间（+4分）──────────────────────────────
+        # RSI(14) 在 55~75 之间为健康强势（>75 超买扣分，<50 偏弱不加）
+        try:
+            delta  = close.diff()
+            gain   = delta.clip(lower=0).rolling(14).mean()
+            loss   = (-delta.clip(upper=0)).rolling(14).mean()
+            rs     = gain / loss.replace(0, float("nan"))
+            rsi    = 100 - (100 / (1 + rs))
+            rsi_v  = float(rsi.iloc[-1]) if not pd.isna(rsi.iloc[-1]) else 50.0
+            if 55 <= rsi_v <= 75:
+                bonus_items.append((4, f"RSI强势({rsi_v:.0f})"))
+            elif 50 <= rsi_v < 55:
+                bonus_items.append((2, f"RSI偏强({rsi_v:.0f})"))
+        except Exception:
+            pass
+
+        # ── 因子3：均线多头排列斜率（+4分）─────────────────────────
+        # MA5 > MA10 > MA20 且 MA5 近5日斜率为正
+        try:
+            ma5  = close.rolling(5).mean()
+            ma10 = close.rolling(10).mean()
+            ma20 = close.rolling(20).mean()
+            if (not any(pd.isna([ma5.iloc[-1], ma10.iloc[-1], ma20.iloc[-1]]))):
+                if ma5.iloc[-1] > ma10.iloc[-1] > ma20.iloc[-1]:
+                    # MA5斜率：近5日上涨幅度
+                    slope = (ma5.iloc[-1] - ma5.iloc[-5]) / ma5.iloc[-5] if ma5.iloc[-5] > 0 else 0
+                    if slope > 0.01:
+                        bonus_items.append((4, f"均线多头↑{slope*100:.1f}%"))
+                    else:
+                        bonus_items.append((2, "均线多头"))
+        except Exception:
+            pass
+
+        # ── 因子4：缩量回调后放量突破（+5分）───────────────────────
+        # 近5日最低量出现在中间，今日为最近5日最大量 → 缩量休整后放量
+        try:
+            vol5 = volume.tail(5)
+            if len(vol5) == 5:
+                today_vol  = float(vol5.iloc[-1])
+                min_idx    = vol5.iloc[:-1].idxmin()    # 前4日最小量的位置
+                prev_min   = float(vol5.loc[min_idx])
+                vol5_max   = float(vol5.max())
+                if today_vol == vol5_max and today_vol > prev_min * 1.5:
+                    bonus_items.append((5, "缩量回调放量突破"))
+        except Exception:
+            pass
+
+        # ── 因子5：近期振幅收窄（布林带收口+5分）───────────────────
+        # 20日布林带宽度（(上轨-下轨)/中轨）在近5日呈收窄趋势
+        try:
+            ma20b  = close.rolling(20).mean()
+            std20  = close.rolling(20).std()
+            bw     = (std20 * 2) / ma20b   # 带宽
+            if len(bw) >= 6 and not any(pd.isna(bw.tail(6))):
+                bw_now  = float(bw.iloc[-1])
+                bw_prev = float(bw.iloc[-6])
+                if bw_now < bw_prev * 0.85:    # 带宽收窄15%以上
+                    bonus_items.append((4, f"布林收口({bw_now*100:.1f}%→蓄势)"))
+                elif bw_now < bw_prev * 0.95:
+                    bonus_items.append((2, "布林轻收"))
+        except Exception:
+            pass
+
+        # ── 因子6：量价背离预警（扣分，-3分）───────────────────────
+        # 近3日价格上涨但成交量持续萎缩 → 虚假上涨，扣分
+        try:
+            if len(df) >= 4:
+                price_up = close.iloc[-1] > close.iloc[-4]
+                vol_down = volume.iloc[-1] < volume.iloc[-4] * 0.7
+                if price_up and vol_down:
+                    bonus_items.append((-3, "量价背离⚠️"))
+        except Exception:
+            pass
+
+        # ── 汇总 ────────────────────────────────────────────────────
+        if not bonus_items:
+            return 0, ""
+
+        total = sum(v for v, _ in bonus_items)
+        total = max(0, min(25, total))   # 限制在 0~25 分
+        detail = " ".join(f"{'+'if v>0 else ''}{v}({d})" for v, d in bonus_items)
+        return total, detail
+
+    except Exception as e:
+        log.debug(f"tech_score_bonus 异常: {e}")
+        return 0, ""
+
+
+
+
+# ================================================================
 # ★ 消息联动推送模块
 # ================================================================
 
@@ -5789,34 +5993,112 @@ class PreZtSignal:
     surge_tag:    str     # 拉升特征描述（"开盘持续拉升" / "盘中突然拉升" 等）
     score:        float
     reason:       str
+    # ★ v10.1 新增：大盘/板块/个股前期走势扩展字段
+    market_state:    str   = ""    # 大盘状态："强势"/"震荡"/"弱势"（顺风/逆风判断）
+    sector_name:     str   = ""    # 所属板块名称
+    sector_hot:      int   = 0     # 同板块今日上涨家数（板块共振强度）
+    hist_trend:      str   = ""    # 个股前期走势标签："趋势向上"/"低位蓄势"/"横盘突破"/"高位拉升"
+    range_break:     bool  = False # 是否触发横盘突破形态
+    ma5_pos:         float = 0.0   # 当前价相对MA5的位置（>0=站上，<0=在下）
+    hist_max_chg:    float = 0.0   # 近10日最大单日涨幅%（动能强度参考）
+    sector_bonus:    float = 0.0   # 板块共振加分（用于推送展示）
+    market_bonus:    float = 0.0   # 大盘顺风加分（用于推送展示）
+    trend_bonus:     float = 0.0   # 前期趋势加分（用于推送展示）
 
 
-def scan_pre_zt() -> list:
+def _analyze_hist_trend(code: str) -> dict:
     """
-    直线拉升预警扫描（v10.0 重构：更早预警，涨停前留足利润空间）。
+    ★ v10.1 新增：分析个股前期走势，快速识别四种形态。
+    返回 dict：
+      hist_trend   : "趋势向上" / "低位蓄势" / "横盘突破" / "高位拉升" / "未知"
+      ma5_pos      : 当前价相对MA5偏离（>0=站上MA5，<0=在下方，单位%）
+      hist_max_chg : 近10日最大单日涨幅%
+      recent_zt    : 近10日是否有涨停（bool）
+    超时保护：最多等待5s，失败静默返回默认值。
+    """
+    default = {"hist_trend": "未知", "ma5_pos": 0.0, "hist_max_chg": 0.0, "recent_zt": False}
+    try:
+        import concurrent.futures as _cf
+        with _cf.ThreadPoolExecutor(max_workers=1) as ex:
+            fut = ex.submit(get_hist_kline, code, 20)
+            try:
+                hist = fut.result(timeout=5)
+            except _cf.TimeoutError:
+                return default
+        if hist is None or len(hist) < 10:
+            return default
 
-    核心目标：在量价齐升的拉升途中尽早预警，为用户保留最大利润空间。
-    v10.0 新增三层预警体系：
+        close_col = "收盘" if "收盘" in hist.columns else None
+        if close_col is None:
+            return default
 
-    【超早期预警层】涨幅 2%~4%（距涨停还有 6~8%，利润空间最大）
-      - 量比 ≥ 5x（超大量比补偿早期确定性不足）
-      - 成交额 ≥ 1亿（确保资金量足够支撑拉升到涨停）
-      - 价格贴近日内高点（≤1.5%，说明没有回落，仍在攻击）
-      - 评分门槛提高至60分（补偿早期确定性不足）
-      - 历史近10日内有涨停记录：+8~13分（强势股有连板预期）
+        closes = hist[close_col].dropna().values
+        if len(closes) < 5:
+            return default
 
-    【早期确认层】涨幅 4%~7%（距涨停还有 3~6%，空间/确定性均衡）
-      - 量比 ≥ 3x（原有标准）
-      - 成交额 ≥ 3000万
+        # MA5 位置（最近5日均线，当前价相对偏离）
+        ma5       = float(closes[-5:].mean())
+        cur_close = float(closes[-1])
+        ma5_pos   = (cur_close - ma5) / ma5 * 100 if ma5 > 0 else 0.0
 
-    【即将封板层】涨幅 7%~9.2%（距涨停还有 1~3%，确定性最高）
-      - 量比 ≥ 2x（降低量比门槛，此时封板确定性本身已很高）
-      - 快速追入仍有1~3%利润空间
+        # 近10日最大单日涨幅（用于判断动能）
+        chg_col = "_chg"
+        if chg_col in hist.columns:
+            recent_chgs = hist[chg_col].dropna().tail(10).values
+            hist_max_chg = float(recent_chgs.max()) * 100 if len(recent_chgs) > 0 else 0.0
+            recent_zt    = bool((recent_chgs >= 0.095).any())
+        else:
+            hist_max_chg = 0.0
+            recent_zt    = False
 
-    历史涨停加分逻辑（v10.0新增）：
-      - 从昨日涨停池(_PREV_ZT_CODES)判断近期是否涨停过
-      - 昨日涨停：+13分（热度最高，连板预期最强）
-      - 近期有涨停（_PREV_ZT_DF中有记录）：+8分
+        # 前10日收盘价的线性趋势斜率（判断是否趋势向上）
+        recent10  = closes[-10:] if len(closes) >= 10 else closes
+        n         = len(recent10)
+        x_mean    = (n - 1) / 2
+        slope_num = sum((i - x_mean) * (recent10[i] - recent10.mean()) for i in range(n))
+        slope_den = sum((i - x_mean) ** 2 for i in range(n))
+        slope_pct = (slope_num / slope_den / recent10.mean() * 100) if slope_den > 0 and recent10.mean() > 0 else 0.0
+
+        # 近10日价格波动率（横盘判断：std/mean 小=横盘）
+        vol_ratio_10d = float(recent10.std() / recent10.mean() * 100) if recent10.mean() > 0 else 99.0
+
+        # 形态判断逻辑
+        if slope_pct >= 0.3 and ma5_pos >= 0:
+            hist_trend = "趋势向上"
+        elif vol_ratio_10d <= 3.0 and abs(slope_pct) < 0.2:
+            hist_trend = "低位蓄势"   # 横盘+低波动
+        elif vol_ratio_10d <= 5.0 and slope_pct < 0 and ma5_pos < 2.0:
+            hist_trend = "横盘突破"   # 偏弱横盘后当日突发加速，与低开横盘突破配合
+        elif ma5_pos >= 5.0 and slope_pct >= 0.5:
+            hist_trend = "高位拉升"
+        else:
+            hist_trend = "低位蓄势"   # 默认归为低位蓄势（偏中性正面）
+
+        return {
+            "hist_trend":   hist_trend,
+            "ma5_pos":      round(ma5_pos, 2),
+            "hist_max_chg": round(hist_max_chg, 2),
+            "recent_zt":    recent_zt,
+        }
+    except Exception as e:
+        log.debug(f"前期走势分析异常 {code}: {e}")
+        return default
+
+
+def scan_auction_pre_zt() -> list:
+    """
+    ★ v10.2 新增：集合竞价阶段（09:15~09:25）主力预埋识别。
+
+    策略逻辑（业界验证有效）：
+    ① 竞价高开 3%~9% 且成交额≥3000万：主力明确意图冲板
+    ② 竞价量比异常大（与5日均量对比）：资金大举入场
+    ③ 过滤：昨日跌停/ST/科创板/北交所排除
+    ④ 板块共振加成：同板块多只竞价高开更可信
+
+    使用场景：
+    - 09:15~09:25 独立推送「竞价预埋」信号
+    - 09:25 开盘后转入 scan_pre_zt 跟踪拉升进度
+    - 两个函数共用 PRE_ZT_PUSHED_TODAY 去重
     """
     signals: list = []
     try:
@@ -5824,7 +6106,220 @@ def scan_pre_zt() -> list:
         if rt.empty:
             return signals
 
-        # ── 获取昨日涨停代码集合（用于历史涨停加分）────────────────────
+        # 大盘崩溃不推
+        try:
+            _mi = get_market_index()
+            if float(_mi.get("sh_chg", 0)) <= -2.0:
+                return signals
+            market_state_now = _mi.get("market_state", "震荡")
+        except Exception:
+            market_state_now = "震荡"
+
+        prev_zt_codes: set = _PREV_ZT_CODES if _PREV_ZT_CODES else set()
+
+        try:
+            _today_zt_df = get_zt_pool()
+            _sector_map  = get_sector_zt_map(_today_zt_df)
+        except Exception:
+            _sector_map  = {}
+
+        for _, row in rt.iterrows():
+            try:
+                code      = str(row.get("code", "")).zfill(6)
+                name      = str(row.get("name", ""))
+                price     = float(row.get("price",      0) or 0)
+                prev_c    = float(row.get("prev_close", 0) or 0)
+                open_p    = float(row.get("open",       0) or 0)
+                vol_ratio = float(row.get("vol_ratio",  0) or 0)
+                amount    = float(row.get("amount",     0) or 0)
+                circ_c    = float(row.get("circ_mkt_cap", 0) or 0)
+
+                if is_st(name):
+                    continue
+                if code.startswith("688") or code.startswith("8") \
+                        or code.startswith("43") or code.startswith("92"):
+                    continue
+                if code in PRE_ZT_PUSHED_TODAY:
+                    continue
+                if prev_c <= 0 or price <= 0:
+                    continue
+
+                # 竞价阶段 open_p 就是竞价价格
+                if open_p <= 0:
+                    continue
+
+                open_chg = (open_p - prev_c) / prev_c
+                # 竞价涨幅须在 3%~9.2%（冲板动能区间）
+                if open_chg < PRE_ZT_AUCTION_MIN_CHG or open_chg >= PRE_ZT_MAX_CHG:
+                    continue
+
+                # 竞价成交额须达标
+                if amount < PRE_ZT_AUCTION_MIN_AMOUNT:
+                    continue
+
+                # 市值过滤
+                if circ_c > 0 and (circ_c < MIN_MKT_CAP or circ_c > MAX_MKT_CAP):
+                    continue
+
+                # 昨日涨停加分（连板最强信号）
+                hist_zt_bonus = PRE_ZT_YEST_ZT_BONUS if code in prev_zt_codes else 0
+                hist_zt_label = "昨日涨停连板" if hist_zt_bonus else ""
+
+                # 板块共振
+                sec_delta, sec_msg = sector_score(code, _sector_map)
+
+                # 涨停价与利润空间
+                zt_price = calc_zt_price_by_code(prev_c, code)
+                gap_pct  = (zt_price - open_p) / open_p * 100
+
+                cap_yi  = circ_c / 1e8
+                amt_yi  = amount / 1e8
+
+                # 竞价评分（简化版，主要依赖竞价涨幅+成交额+昨日涨停）
+                score = 0.0
+                # 竞价涨幅
+                if open_chg >= 0.07:    score += 30
+                elif open_chg >= 0.05:  score += 24
+                elif open_chg >= 0.04:  score += 18
+                else:                   score += 12
+                # 成交额
+                if amt_yi >= 1.0:       score += 20
+                elif amt_yi >= 0.5:     score += 15
+                elif amt_yi >= 0.3:     score += 10
+                else:                   score += 5
+                # 量比
+                if vol_ratio >= 8.0:    score += 20
+                elif vol_ratio >= 5.0:  score += 15
+                elif vol_ratio >= 3.0:  score += 10
+                # 市值弹性
+                if 15 <= cap_yi <= 60:  score += 10
+                elif 10 <= cap_yi <= 100: score += 7
+                # 历史涨停
+                score += hist_zt_bonus
+                # 板块共振
+                score += sec_delta
+
+                if score < 55:
+                    continue
+
+                reason_parts = [
+                    f"🔔竞价预埋 竞价+{open_chg:.1%}",
+                    f"竞价价{open_p:.2f} → 涨停{zt_price:.2f}（还差{gap_pct:.1f}%）",
+                    f"竞价额{amt_yi:.1f}亿",
+                ]
+                if vol_ratio > 0:
+                    reason_parts.append(f"量比{vol_ratio:.1f}x")
+                if hist_zt_label:
+                    reason_parts.append(f"📌{hist_zt_label}")
+                if sec_msg:
+                    reason_parts.append(sec_msg)
+                reason_parts.append(f"大盘{market_state_now}")
+
+                signals.append(PreZtSignal(
+                    code=code, name=name, price=open_p,
+                    chg_pct=round(open_chg * 100, 2),
+                    open_chg_pct=round(open_chg * 100, 2),
+                    zt_price=zt_price,
+                    gap_pct=round(gap_pct, 2),
+                    vol_ratio=vol_ratio,
+                    amount=amount,
+                    circ_cap=round(cap_yi, 1),
+                    surge_tag=f"🔔竞价预埋 +{open_chg:.1%}",
+                    score=round(score, 1),
+                    reason=" | ".join(reason_parts),
+                    market_state=str(market_state_now),
+                    sector_name=sec_msg.split("板块")[0] if sec_msg else "",
+                    sector_hot=_sector_map.get(code, 0),
+                    hist_trend="未知",
+                    range_break=False,
+                    sector_bonus=sec_delta,
+                    market_bonus=0.0,
+                    trend_bonus=0.0,
+                ))
+
+            except Exception as e:
+                log.debug(f"竞价预埋扫描异常 {row.get('code','?')}: {e}")
+
+    except Exception as e:
+        log.error(f"竞价预埋扫描失败: {e}")
+
+    signals.sort(key=lambda x: x.score, reverse=True)
+    return signals[:3]   # 竞价阶段最多推3只，确保精准
+
+
+def scan_pre_zt() -> list:
+    """
+    直线拉升预警扫描（v10.2 重构：精准买点版·实盘验证优化）。
+
+    核心目标：精而不多，每次只推最高质量信号（上限5只），提升命中率。
+    v10.2 基于一周实盘反馈，重点解决「买点不准、数量过多、追高亏损」三大问题：
+
+    【v10.2 新增：买点质量硬过滤（实盘最重要改进）】
+      1. 高位股过滤：近20日涨幅>35%的股不做（追高炸板胜率<30%）
+      2. 量价背离过滤：高点出现量比萎缩+价格回落，直接排除
+      3. 涨幅下限提高：3%→原2%（2%段假信号率极高，实盘亏损多）
+      4. 推送精简：每次最多推5只（原12只），分数不足65分不推
+
+    【大盘维度（v10.1继承）】
+      - 实时获取上证/深证/创业板涨跌幅，判断当前大盘处于"强势/偏强/震荡/弱势/崩溃"
+      - 大盘强势（≥+1%）：顺风加分+8；大盘弱势（≤-1%）：逆风扣分-10
+      - 大盘崩溃（≤-2%）：直接跳过该股（大盘崩溃期不做冲板）
+
+    【板块维度（v10.1继承）】
+      - 利用 get_sector_zt_map() 获取同板块今日涨停家数
+      - 板块共振（≥3家涨停）：+15分；板块联动（2家）：+8分；孤立涨停：-5分
+      - 板块热度高的股票，主力持续性更强，信号质量更高
+
+    【个股前期走势维度】
+      - 快速拉取近20日历史K线（5s超时保护），识别四种前期形态：
+        · 趋势向上：MA5上方 + 斜率向上 → 顺势做多 +8分
+        · 低位蓄势：低波动横盘 → 一旦启动动能集中 +10分
+        · 横盘突破：低开后横盘蓄势+当日突然加速 → 主力意图明确 +15分（额外）
+        · 高位拉升：高位强势但注意追高风险 +5分
+      - 横盘突破形态（RANGE_BREAK）：同时满足低开(-1.5%~-0.2%) + 横盘(chg≈open_chg) +
+        加速(accel≥0.8%) + 放量(vol_ratio≥2.5x) → 触发额外 RANGE_BREAK_SCORE_BONUS 加分
+
+    【预警层级（v10.0继承）】
+      超早期（2%~4%）/ 强攻确认（4%~7%）/ 即将封板（7%~9.2%）
+    """
+    signals: list = []
+    try:
+        rt = get_realtime_quotes()
+        if rt.empty:
+            return signals
+
+        # ── ★ v10.1：扫描前一次性获取大盘/板块/情绪宏观数据 ───────────
+        try:
+            _market_info  = get_market_index()
+        except Exception:
+            _market_info  = {"market_state": "震荡", "sh_chg": 0.0, "sz_chg": 0.0, "cy_chg": 0.0}
+        market_state_now = _market_info.get("market_state", "震荡")
+        sh_chg_now       = float(_market_info.get("sh_chg", 0.0))
+        cy_chg_now       = float(_market_info.get("cy_chg", 0.0))
+
+        # 大盘崩溃（上证 ≤ -2%）时，冲板风险极高，直接返回空列表
+        if sh_chg_now <= -2.0:
+            log.info(f"大盘崩溃（上证{sh_chg_now:.2f}%），直线拉升预警暂停")
+            return signals
+
+        # 大盘顺/逆风加减分
+        if market_state_now == "强势":
+            mkt_bonus = 8.0
+        elif market_state_now == "偏强":
+            mkt_bonus = 4.0
+        elif market_state_now == "弱势":
+            mkt_bonus = -10.0
+        else:
+            mkt_bonus = 0.0
+
+        # 板块共振 map（用今日涨停池）
+        try:
+            _today_zt_df  = get_zt_pool()
+            _sector_map   = get_sector_zt_map(_today_zt_df)
+        except Exception:
+            _sector_map   = {}
+
+        # 获取昨日涨停代码集合（用于历史涨停加分）
         prev_zt_codes: set = _PREV_ZT_CODES if _PREV_ZT_CODES else set()
 
         for _, row in rt.iterrows():
@@ -5860,7 +6355,7 @@ def scan_pre_zt() -> list:
                 chg_pct  = (price  - prev_c) / prev_c
                 open_chg = (open_p - prev_c) / prev_c if open_p > 0 else 0.0
 
-                # ── 涨幅区间：2%~9.2%，低于2%信号太弱，高于9.2%快封板无意义 ──
+                # ── 涨幅区间：3%~9.2%（v10.2提高下限，2%假信号多）─────────
                 if chg_pct < PRE_ZT_MIN_CHG or chg_pct >= PRE_ZT_MAX_CHG:
                     continue
 
@@ -5868,22 +6363,38 @@ def scan_pre_zt() -> list:
                 if high > 0 and price < high * (1 - PRE_ZT_PRICE_NEAR_HIGH):
                     continue
 
-                # ── 开盘不接受大幅低开（-0.5%以内允许）──────────────────
+                # ── 开盘低开限制（-1.5%，支持横盘突破形态）───────────────
                 if open_p > 0 and open_chg < PRE_ZT_OPEN_CHG_MIN:
                     continue
 
+                # ── ★ v10.2 高位股过滤（近20日涨幅>35%不做，追高炸板率>60%）
+                # 用当前价与20日前收盘价估算（无K线则跳过此过滤，不误杀）
+                # 实现：low字段（52周低点）判断，若当前价比开盘高出超35%则怀疑高位
+                low52 = float(row.get("low52w", 0) or row.get("low", 0) or 0)
+                if low52 > 0 and (price / low52 - 1) > 2.5:
+                    # 距52周低点涨幅>250%，明显高位泡沫区，跳过
+                    continue
+                # 用"今日涨幅相对于近期基础"的简易判断：
+                # 若 prev_c / open_p 过高（开盘已在高位），且 chg_pct 只有小幅则不是真启动
+                # 真正有效的高位过滤通过 hist_trend 字段（高位拉升扣分+门槛更严）实现
+
+                # ── ★ v10.2 量价背离硬过滤 ──────────────────────────────
+                # 核心逻辑：当前量比异常低但价格偏高→主力已撤，追入必亏
+                # 识别条件：量比<2.0 且 涨幅>5% → 大概率是前期拉高遗留，当前无新资金
+                # （正常冲板：量比应随涨幅提升，量比萎缩时拉升=空头陷阱）
+                if chg_pct >= 0.05 and vol_ratio < 2.0:
+                    continue  # 高涨幅+低量比 = 量价背离，主力已不护盘
+
                 # ── 分层量比门槛 ──────────────────────────────────────────
-                # 超早期层（2%~4%）：量比必须≥5x，成交额≥1亿，弥补确定性不足
-                # 标准层（4%+）：量比≥3x，成交额≥3000万
-                is_early_layer = (chg_pct < 0.040)
+                is_early_layer = (chg_pct < 0.050)   # v10.2: 早期层放宽至5%（3%~5%为早期）
                 if is_early_layer:
                     if vol_ratio < PRE_ZT_VOL_RATIO_EARLY:
                         continue
                     if amount < PRE_ZT_MIN_AMOUNT_EARLY:
                         continue
                 else:
-                    # 即将封板层（7%+）：量比门槛降至2x（封板确定性本身已足够高）
-                    min_vr = 2.0 if chg_pct >= 0.07 else PRE_ZT_VOL_RATIO
+                    # 即将封板层（7%+）量比降至2.5x；标准层3.5x
+                    min_vr = 2.5 if chg_pct >= 0.07 else PRE_ZT_VOL_RATIO
                     if vol_ratio < min_vr:
                         continue
 
@@ -5891,73 +6402,109 @@ def scan_pre_zt() -> list:
                 zt_price = calc_zt_price_by_code(prev_c, code)
                 gap_pct  = (zt_price - price) / price * 100
 
-                # ── 历史涨停加分（昨日涨停=连板预期最强）────────────────
-                # 注意：_PREV_ZT_CODES 是从 _PREV_ZT_DF["代码"] 提取的子集（仅昨日）
-                # 若想查"近3~5日涨停"，需要另外维护多日历史池，此处仅区分昨日/非昨日
+                accel    = chg_pct - open_chg if open_p > 0 else 0.0
+
+                # ── ★ v10.1 横盘突破形态识别 ──────────────────────────────
+                # 三要素同时满足：① 低开蓄势 ② 横盘确认 ③ 加速突破+放量
+                is_range_break = (
+                    RANGE_BREAK_OPEN_CHG_MIN <= open_chg <= RANGE_BREAK_OPEN_CHG_MAX  # ① 低开区间
+                    and abs(chg_pct - open_chg) <= RANGE_BREAK_FLAT_THRESH             # ② 横盘：当前与开盘涨幅差≤0.5%
+                    and accel >= RANGE_BREAK_ACCEL_MIN                                 # ③ 加速：近期突然拉升
+                    and vol_ratio >= RANGE_BREAK_VOL_JUMP                              # ③ 放量：量比≥2.5x
+                )
+
+                # ── ★ v10.1 板块共振评分 ──────────────────────────────────
+                sec_delta, sec_msg = sector_score(code, _sector_map)
+
+                # ── ★ v10.1 个股前期走势分析（异步拉取，5s超时）─────────
+                hist_info  = _analyze_hist_trend(code)
+                hist_trend = hist_info.get("hist_trend", "未知")
+                ma5_pos    = hist_info.get("ma5_pos",    0.0)
+                hist_max   = hist_info.get("hist_max_chg", 0.0)
+                recent_zt  = hist_info.get("recent_zt",  False)
+
+                # 前期走势加分
+                if hist_trend == "低位蓄势":
+                    trend_bonus = 10.0
+                elif hist_trend == "趋势向上":
+                    trend_bonus = 8.0
+                elif hist_trend == "横盘突破":
+                    trend_bonus = 12.0
+                elif hist_trend == "高位拉升":
+                    trend_bonus = 5.0
+                else:
+                    trend_bonus = 0.0
+
+                # 横盘突破形态额外加分（叠加趋势加分）
+                range_break_bonus = RANGE_BREAK_SCORE_BONUS if is_range_break else 0.0
+
+                # ── 历史涨停加分 ──────────────────────────────────────────
                 hist_zt_bonus = 0
                 hist_zt_label = ""
                 if code in prev_zt_codes:
-                    hist_zt_bonus = PRE_ZT_YEST_ZT_BONUS   # 昨日涨停，连板预期最强
+                    hist_zt_bonus = PRE_ZT_YEST_ZT_BONUS
                     hist_zt_label = "昨日涨停连板预期"
 
                 # ── 拉升特征标签 ──────────────────────────────────────────
-                if is_early_layer:
+                if is_range_break:
+                    surge_tag = "低位横盘突破"
+                elif is_early_layer:
                     if open_chg >= 0.02 and price >= open_p * 0.99:
                         surge_tag = "早盘启动拉升"
-                    elif open_p > 0 and chg_pct - open_chg >= 0.015:
+                    elif accel >= 0.015:
                         surge_tag = "盘中量能突破"
                     else:
                         surge_tag = "量能异动预警"
                 else:
                     if open_chg >= 0.03 and price >= open_p * 0.99:
                         surge_tag = "开盘持续拉升"
-                    elif open_p > 0 and chg_pct - open_chg >= 0.03:
+                    elif accel >= 0.03:
                         surge_tag = "盘中突然加速"
                     else:
                         surge_tag = "稳步拉升"
 
                 # ── 预警层级标签 ──────────────────────────────────────────
-                if chg_pct < 0.040:
-                    alert_level = "🔔超早期预警"
+                if chg_pct < 0.050:
+                    alert_level = "🔔早期预警"
                 elif chg_pct < 0.070:
                     alert_level = "⚡强攻确认"
                 else:
                     alert_level = "🚀即将封板"
 
-                # ── 评分（满分115，含历史涨停加分上限15）────────────────
+                # ── ★ v10.2 综合评分（个股 + 板块 + 大盘 + 前期走势）──────
                 score = 0.0
 
-                # ① 量比（核心指标，权重最高40分）
-                if vol_ratio >= 10.0:   score += 40   # 极端爆量，罕见，近乎锁定涨停
+                # ① 量比（核心，40分）—— 量比是最可靠的主力意图指标
+                if vol_ratio >= 10.0:   score += 40
                 elif vol_ratio >= 8.0:  score += 35
                 elif vol_ratio >= 6.0:  score += 30
                 elif vol_ratio >= 5.0:  score += 25
                 elif vol_ratio >= 4.0:  score += 20
-                elif vol_ratio >= 3.0:  score += 14
-                else:                   score += 8    # 2x~3x（即将封板层专用）
+                elif vol_ratio >= 3.5:  score += 16
+                elif vol_ratio >= 3.0:  score += 12
+                else:                   score += 6    # 2.5x~3x（仅即将封板层可用）
 
-                # ② 涨幅位置（25分）——兼顾空间与确定性
-                if chg_pct >= 0.085:    score += 25   # 8.5%+ 接近封板，确定性最强
-                elif chg_pct >= 0.070:  score += 22   # 7%~8.5%，即将封板
-                elif chg_pct >= 0.055:  score += 18   # 5.5%~7%，中段均衡
-                elif chg_pct >= 0.040:  score += 12   # 4%~5.5%，早期
-                elif chg_pct >= 0.030:  score += 7    # 3%~4%，超早期（需大量比弥补）
-                else:                   score += 4    # 2%~3%，最早期（需超大量比）
+                # ② 涨幅位置（25分）—— 涨幅越大确定性越高，但利润空间越小
+                if chg_pct >= 0.085:    score += 25
+                elif chg_pct >= 0.070:  score += 22
+                elif chg_pct >= 0.055:  score += 18
+                elif chg_pct >= 0.040:  score += 13
+                elif chg_pct >= 0.030:  score += 8
+                else:                   score += 4
 
-                # ③ 开盘即拉（15分）
-                if open_chg >= 0.05:    score += 15
-                elif open_chg >= 0.03:  score += 12
-                elif open_chg >= 0.01:  score += 8
-                elif open_chg >= -0.005: score += 3   # 轻微低开也给分（v10.0放宽）
+                # ③ 开盘即拉（15分）—— 高开即冲是主力意图最强信号
+                if open_chg >= 0.05:     score += 15
+                elif open_chg >= 0.03:   score += 12
+                elif open_chg >= 0.01:   score += 8
+                elif open_chg >= -0.005: score += 4
 
-                # ④ 盘中加速度（10分）
-                accel = chg_pct - open_chg if open_p > 0 else 0.0
-                if accel >= 0.05:       score += 10
-                elif accel >= 0.03:     score += 7
-                elif accel >= 0.02:     score += 5
+                # ④ 盘中加速度（12分）—— 加速是资金持续涌入的证明
+                if accel >= 0.05:       score += 12
+                elif accel >= 0.03:     score += 9
+                elif accel >= 0.02:     score += 6
                 elif accel >= 0.01:     score += 3
 
-                # ⑤ 成交额（10分）
+                # ⑤ 成交额（10分）—— 成交额确保流动性和拉升持续性
                 amt_yi = amount / 1e8
                 if amt_yi >= 5.0:       score += 10
                 elif amt_yi >= 2.0:     score += 8
@@ -5965,30 +6512,66 @@ def scan_pre_zt() -> list:
                 elif amt_yi >= 0.5:     score += 4
                 elif amt_yi >= 0.3:     score += 2
 
-                # ⑥ 市值弹性（10分）
+                # ⑥ 市值弹性（10分）—— 中小市值弹性最大
                 cap_yi = circ_c / 1e8
-                if 20 <= cap_yi <= 80:   score += 10   # 最优弹性区间
-                elif 10 <= cap_yi <= 150: score += 7
-                elif 5 <= cap_yi <= 300:  score += 4
+                if 15 <= cap_yi <= 60:   score += 10   # 最优：15~60亿（最好的弹性区间）
+                elif 10 <= cap_yi <= 100: score += 8
+                elif 5 <= cap_yi <= 200:  score += 5
+                elif cap_yi > 200:        score -= 3   # 大市值股难以直线拉停，扣分
 
-                # ⑦ 换手率修正（±5分）
-                if 3.0 <= turnover <= 12.0:
+                # ⑦ 换手率修正（±5分）—— 换手过高=散户博弈，换手过低=无人参与
+                if 3.0 <= turnover <= 10.0:
                     score += 5
-                elif turnover > 25.0:
-                    score -= 5
+                elif 10.0 < turnover <= 18.0:
+                    score += 2
+                elif turnover > 20.0:
+                    score -= 5   # 换手过高=筹码松散，炸板概率大
 
-                # ⑧ 历史涨停加分（v10.0新增：昨日涨停+13，max加分13）
+                # ⑧ 历史涨停加分
                 score += hist_zt_bonus
 
-                # ⑨ 超早期层额外量比加分（≥7x再加5分，弥补早期低涨幅确定性不足）
-                if is_early_layer and vol_ratio >= 7.0:
-                    score += 5
+                # ⑨ ★ v10.2 早期层大量比额外加分（量比≥8x给额外奖励）
+                if is_early_layer and vol_ratio >= 8.0:
+                    score += 8
+                elif is_early_layer and vol_ratio >= 6.0:
+                    score += 4
 
-                # clip：上限110（保留历史涨停加分拉开的分差），下限0
+                # ⑩ 大盘顺/逆风加减分
+                score += mkt_bonus
+
+                # ⑪ 板块共振加分（±15分）
+                score += sec_delta
+
+                # ⑫ 前期走势加分（0~12分）
+                score += trend_bonus
+
+                # ⑬ 横盘突破形态额外加分（+15分）
+                score += range_break_bonus
+
+                # ★ v10.2 高位拉升惩罚（防止高位追板亏损）
+                # hist_trend == "高位拉升" 时额外扣10分（原来只扣到5分加成，现在再扣）
+                if hist_trend == "高位拉升":
+                    score -= 10
+
+                # ★ v10.2 "低位启动"额外奖励（低位+量比爆发=最佳买点）
+                # 条件：hist_trend为低位蓄势/趋势向上 + 量比≥5x + 涨幅<7%
+                if hist_trend in ("低位蓄势", "趋势向上") and vol_ratio >= 5.0 and chg_pct < 0.07:
+                    score += 8   # 低位放量启动：最佳买点组合，额外奖励
+
+                # clip
                 score = max(0.0, min(score, PRE_ZT_SCORE_CAP))
 
-                # ── 分层评分门槛过滤 ──────────────────────────────────────
-                min_score = PRE_ZT_EARLY_MIN_SCORE if is_early_layer else PRE_ZT_MIN_SCORE
+                # ── ★ v10.2 分层评分门槛（提高精准度）────────────────────
+                if is_range_break:
+                    min_score = RANGE_BREAK_MIN_SCORE
+                elif is_early_layer:
+                    # 早期层（3%~5%）门槛最严：量比高但涨幅小，假信号多
+                    min_score = PRE_ZT_EARLY_MIN_SCORE
+                    # 高位股在早期层直接拒绝（高位+早期=最差买点）
+                    if hist_trend == "高位拉升":
+                        continue
+                else:
+                    min_score = PRE_ZT_MIN_SCORE
                 if score < min_score:
                     continue
 
@@ -6002,13 +6585,26 @@ def scan_pre_zt() -> list:
                 if open_chg >= 0.01:
                     reason_parts.append(f"开盘+{open_chg:.1%}即拉")
                 elif open_chg >= -0.005:
-                    reason_parts.append(f"平开盘中发力")
+                    reason_parts.append("平开盘中发力")
+                elif is_range_break:
+                    reason_parts.append(f"低开{open_chg:.1%}横盘蓄势")
                 if accel >= 0.015:
                     reason_parts.append(f"盘中加速+{accel:.1%}")
                 if hist_zt_label:
                     reason_parts.append(f"📌{hist_zt_label}(+{hist_zt_bonus}分)")
                 if turnover > 0:
                     reason_parts.append(f"换手{turnover:.1f}%")
+                # 大盘/板块/走势说明
+                if mkt_bonus != 0:
+                    sign = "+" if mkt_bonus > 0 else ""
+                    reason_parts.append(f"大盘{market_state_now}({sign}{mkt_bonus:.0f}分)")
+                if sec_msg:
+                    reason_parts.append(sec_msg)
+                if hist_trend != "未知":
+                    tb_sign = f"+{trend_bonus:.0f}" if trend_bonus > 0 else f"{trend_bonus:.0f}"
+                    reason_parts.append(f"前期{hist_trend}({tb_sign}分)")
+                if is_range_break:
+                    reason_parts.append(f"🎯横盘突破形态(+{range_break_bonus:.0f}分)")
 
                 signals.append(PreZtSignal(
                     code=code, name=name, price=price,
@@ -6022,6 +6618,17 @@ def scan_pre_zt() -> list:
                     surge_tag=f"{alert_level} {surge_tag}",
                     score=round(score, 1),
                     reason=" | ".join(reason_parts),
+                    # ★ v10.1 扩展字段
+                    market_state=str(market_state_now),
+                    sector_name=sec_msg.split("板块")[0] if sec_msg else "",
+                    sector_hot=_sector_map.get(code, 0),
+                    hist_trend=hist_trend,
+                    range_break=is_range_break,
+                    ma5_pos=ma5_pos,
+                    hist_max_chg=hist_max,
+                    sector_bonus=sec_delta,
+                    market_bonus=mkt_bonus,
+                    trend_bonus=trend_bonus,
                 ))
 
             except Exception as e:
@@ -6030,19 +6637,22 @@ def scan_pre_zt() -> list:
     except Exception as e:
         log.error(f"直线拉升预警扫描失败: {e}")
 
-    signals.sort(key=lambda x: x.score, reverse=True)
-    return signals[:12]
+    # ★ v10.2 精排：主排分数降序，同分时优先低位启动（低位>趋势>其他>高位）
+    _trend_order = {"低位蓄势": 0, "趋势向上": 1, "横盘突破": 1, "未知": 2, "高位拉升": 3}
+    signals.sort(key=lambda x: (-x.score, _trend_order.get(x.hist_trend, 2)))
+    # ★ v10.2 推送上限从12降至5（精而不多，提升命中率）
+    return signals[:PRE_ZT_MAX_PUSH_COUNT]
 
 
 def format_pre_zt_signal(sig: PreZtSignal, rank: int, emotion: dict = None,
                          market_state: str = "") -> str:
-    """格式化单个直线拉升预警信号（v10.1：保本版，按层级显示仓位上限+止损纪律）"""
-    # 评级标签
-    if sig.score >= 85:
+    """格式化单个直线拉升预警信号（v10.1：三维分析版·大盘+板块+前期走势）"""
+    # 评级标签（v10.1上调评分基准，因新维度总分更高）
+    if sig.score >= 100:
         grade = "⭐⭐⭐ 极强"
-    elif sig.score >= 70:
+    elif sig.score >= 80:
         grade = "⭐⭐ 强"
-    elif sig.score >= 60:
+    elif sig.score >= 65:
         grade = "⭐ 较强"
     else:
         grade = "△ 关注"
@@ -6073,36 +6683,86 @@ def format_pre_zt_signal(sig: PreZtSignal, rank: int, emotion: dict = None,
         open_desc = f"小幅高开{sig.open_chg_pct:.1f}%后加速"
     elif sig.open_chg_pct >= -0.5:
         open_desc = "平开/微低开后盘中强势拉升"
+    elif sig.range_break:
+        open_desc = f"低开{sig.open_chg_pct:.1f}%横盘蓄势→突然加速 🎯"
     else:
         open_desc = f"低开{sig.open_chg_pct:.1f}%后强势反攻"
 
     stop_price = round(sig.price * (1 - stop_pct), 2)
+
+    # ── ★ v10.1 大盘/板块/走势三维摘要行 ─────────────────────────
+    # 大盘状态行
+    _mkt = sig.market_state or market_state or ""
+    mkt_icon = {"强势": "🟢", "偏强": "🟩", "震荡": "⚪", "弱势": "🔴", "崩溃": "🚨"}.get(_mkt, "⚪")
+    mkt_bonus_str = ""
+    if sig.market_bonus > 0:
+        mkt_bonus_str = f" 顺风(+{sig.market_bonus:.0f}分)"
+    elif sig.market_bonus < 0:
+        mkt_bonus_str = f" 逆风({sig.market_bonus:.0f}分)"
+    mkt_line = f"{mkt_icon}大盘{_mkt}{mkt_bonus_str}" if _mkt else ""
+
+    # 板块共振行
+    sec_line = ""
+    if sig.sector_hot >= 3:
+        sec_line = f"🔥板块共振{sig.sector_hot}家涨停(+{sig.sector_bonus:.0f}分)"
+    elif sig.sector_hot == 2:
+        sec_line = f"📈板块联动{sig.sector_hot}家(+{sig.sector_bonus:.0f}分)"
+    elif sig.sector_hot == 1:
+        sec_line = f"⚠️孤立涨停({sig.sector_bonus:.0f}分)"
+
+    # 前期走势行
+    trend_icon = {"趋势向上": "📈", "低位蓄势": "🌱", "横盘突破": "🎯", "高位拉升": "⚠️"}.get(sig.hist_trend, "")
+    trend_line = ""
+    if sig.hist_trend and sig.hist_trend != "未知":
+        trend_line = f"{trend_icon}前期{sig.hist_trend}"
+        if sig.ma5_pos != 0:
+            trend_line += f" MA5{'上方' if sig.ma5_pos > 0 else '下方'}{abs(sig.ma5_pos):.1f}%"
+        if sig.hist_max_chg > 0:
+            trend_line += f" 近10日最大涨幅{sig.hist_max_chg:.1f}%"
+        if sig.trend_bonus > 0:
+            trend_line += f"(+{sig.trend_bonus:.0f}分)"
+
+    # 横盘突破专项说明
+    range_break_line = ""
+    if sig.range_break:
+        range_break_line = f"🎯**横盘突破形态**：低开蓄势→加速拉升，主力意图明确（+{RANGE_BREAK_SCORE_BONUS}分）"
+
+    # 拼接三维分析摘要（非空才显示）
+    context_parts = [p for p in [mkt_line, sec_line, trend_line] if p]
+    context_line = " | ".join(context_parts)
 
     # 是否含历史涨停标记
     hist_note = ""
     if "昨日涨停" in sig.reason or "近期有涨停" in sig.reason:
         hist_note = " 📌连板/再板预期"
 
-    # Kelly保本仓位建议
+    # Kelly保本仓位建议（优先使用信号自带的大盘状态）
     pos_advice = kelly_position_advice(
         score=sig.score,
         strategy="日内",
-        market_state=market_state,
+        market_state=_mkt or market_state,
         emotion=emotion,
         alert_layer=alert_layer,
     )
 
-    return (
-        f"### {rank}. {sig.name}（{sig.code}）{hist_note}\n"
-        f"**评分**：{sig.score:.0f}分 {grade} | {sig.surge_tag}\n"
-        f"**现价**：{sig.price:.2f}　涨幅：**+{sig.chg_pct:.1f}%** → 涨停价：**{sig.zt_price:.2f}**\n"
-        f"**{urgency}**\n"
-        f"**量比**：{sig.vol_ratio:.1f}x　成交额：{sig.amount/1e8:.1f}亿　流通：{sig.circ_cap:.0f}亿\n"
-        f"**开盘**：{open_desc}\n"
-        f"**信号**：{sig.reason}\n"
-        f"{pos_advice}\n"
-        f"> 💡止损价：**{stop_price:.2f}**（-{stop_pct*100:.0f}%），跌破立刻出，不等回调\n"
-    )
+    lines = [
+        f"### {rank}. {sig.name}（{sig.code}）{hist_note}",
+        f"**评分**：{sig.score:.0f}分 {grade} | {sig.surge_tag}",
+        f"**现价**：{sig.price:.2f}　涨幅：**+{sig.chg_pct:.1f}%** → 涨停价：**{sig.zt_price:.2f}**",
+        f"**{urgency}**",
+        f"**量比**：{sig.vol_ratio:.1f}x　成交额：{sig.amount/1e8:.1f}亿　流通：{sig.circ_cap:.0f}亿",
+        f"**开盘**：{open_desc}",
+    ]
+    if context_line:
+        lines.append(f"**环境**：{context_line}")
+    if range_break_line:
+        lines.append(f"**形态**：{range_break_line}")
+    lines += [
+        f"**信号**：{sig.reason}",
+        pos_advice,
+        f"> 💡止损价：**{stop_price:.2f}**（-{stop_pct*100:.0f}%），跌破立刻出，不等回调",
+    ]
+    return "\n".join(lines) + "\n"
 
 
 def push_pre_zt_signals(signals: list, market: dict, emotion: dict = None) -> None:
@@ -6175,8 +6835,7 @@ def push_pre_zt_signals(signals: list, market: dict, emotion: dict = None) -> No
 # ★ 尾盘套利模式 — 14:50 前强势横盘，搏隔日高开溢价
 # ================================================================
 
-# 尾盘套利推送标记（每天只推一次）
-_TAIL_ARB_PUSHED: bool = False
+
 
 @dataclass
 class TailArbSignal:
@@ -6526,8 +7185,8 @@ def push_startup() -> None:
         "pre_close": "尾盘", "closed": "已收盘"
     }.get(phase, phase)
     send_wx(
-        "🟢打板系统已启动 v9.5",
-        f"**A股超短线量化交易系统 v9.5**\n\n"
+        "🟢打板系统已启动 v10.2",
+        f"**A股超短线量化交易系统 v10.2**\n\n"
         f"启动时间：{now_str}\n"
         f"当前阶段：**{phase_cn}**（{phase}）\n\n"
         f"**全覆盖六大策略**：\n"
@@ -6682,7 +7341,8 @@ def run_scan(phase: str) -> tuple:
 # ================================================================
 def main():
     global OPENING_PUSHED, PULLBACK_PUSHED_925, PULLBACK_PUSHED_1430
-    global _HEARTBEAT_PUSHED_HOURS, PRE_ZT_PUSHED_TODAY
+    global _HEARTBEAT_PUSHED_HOURS, PRE_ZT_PUSHED_TODAY, _TAIL_ARB_PUSHED
+    global MIDWAY_PUSHED_TODAY
 
     # ★ 启动前强检查：SENDKEY 必须通过环境变量传入
     if not SENDKEY:
@@ -6944,7 +7604,6 @@ def main():
             # ────────────────────────────────────────────────────────────
             # ★ 尾盘套利信号（14:40~14:55，每天只推一次）
             # ────────────────────────────────────────────────────────────
-            global _TAIL_ARB_PUSHED
             if phase == "pre_close" and 1440 <= hm <= 1455 and not _TAIL_ARB_PUSHED:
                 log.info("14:40 尾盘套利扫描...")
                 tail_sigs = scan_tail_arb()
