@@ -1,22 +1,15 @@
 import time
 import requests
-import pandas as pd
-import numpy as np
 import re
-from datetime import datetime, timedelta
+from datetime import datetime
 from dataclasses import dataclass
 
 from config import *
 from logger import log
 
-# ====================== 全局状态 ======================
-PRE_ZT_PUSHED_MORNING = set()
-PRE_ZT_PUSHED_AFTERNOON = set()
-_PREV_Z = set()
-_LHB = set()
-_CONCEPT = {}
-_NORTH = 0.0
-_MARKET_BREADTH = {"rise": 0, "fall": 0, "limit_up": 0}
+PUSHED_TODAY = set()
+JJPUSH = False
+OPEN_PUSH = False
 
 @dataclass
 class Signal:
@@ -24,304 +17,241 @@ class Signal:
     name: str
     price: float
     chg: float
-    zt_price: float
-    gap: float
-    vol_ratio: float
-    turnover: float
-    main_in: float
-    concept: str
-    sector_strength: str
-    lhb: bool
-    north: bool
-    leader: int
-    reclose_prob: int
-    rsi: float
-    macd_strong: bool
+    open_p: float
+    pre: float
+    low: float
+    high: float
+    amount: float
+    main_power: float
+    float_cap: float
+    sector: str
+    profit_mode: str
+    push_title: str
     stop_loss: float
+    take_profit: float
     score: float
     reason: str
 
-# ====================== 时间 ======================
 def now():
     return datetime.now()
 
 def is_trading_day():
-    wd = now().weekday()
-    return wd < 5  # 周一到周五
-
-def is_trading_time():
-    h = now().hour
-    m = now().minute
-    # 早盘 9:30-11:30
-    if h == 9 and m >= 25:
-        return True
-    if h == 10:
-        return True
-    if h == 11 and m <= 30:
-        return True
-    # 午盘 13:00-15:00
-    if h == 13:
-        return True
-    if h == 14:
-        return True
-    return False
+    return now().weekday() < 5
 
 def phase():
-    h = now().hour
-    m = now().minute
+    h, m = now().hour, now().minute
     hm = h * 100 + m
-
-    if 925 <= hm < 1030:
+    if 925 <= hm < 930:
+        return "call_auction"
+    elif 930 <= hm < 931:
+        return "open_minute"
+    elif 931 <= hm < 1130:
         return "morning"
-    elif 1300 <= hm < 1400:
+    elif 1300 <= hm < 1430:
         return "afternoon"
-    # 只要在交易时间内，就不判定为 closed
-    if is_trading_time():
-        return "trading"
+    elif 1430 <= hm < 1500:
+        return "endgame"
     return "closed"
 
-# ====================== 推送 ======================
 def send(title, content):
     if not SENDKEY:
-        log.warning("无 SENDKEY")
         return False
     try:
         url = f"https://sctapi.ftqq.com/{SENDKEY}.send"
-        requests.post(url, data={"title": title, "desp": content}, timeout=TIMEOUT)
-        log.info(f"已推送: {title}")
+        requests.post(url, data={"title": title, "desp": content}, timeout=3)
         return True
-    except Exception as e:
-        log.error(f"推送失败: {e}")
+    except:
         return False
 
-# ====================== 新浪行情解析工具 ======================
-def parse_sina_stock(text):
+def get_all_codes():
     try:
-        text = text.strip()
-        if not text or "var hq_str" not in text:
-            return None
-        part = text.split("=")[-1].replace('"', "").split(",")
-        if len(part) < 30:
-            return None
-        name = part[0]
-        open_p = float(part[1]) if part[1] else 0.0
-        pre = float(part[2]) if part[2] else 0.0
-        price = float(part[3]) if part[3] else 0.0
-        high = float(part[4]) if part[4] else 0.0
-        low = float(part[5]) if part[5] else 0.0
-        vol = float(part[8]) if part[8] else 0.0
-        amount = float(part[9]) if part[9] else 0.0
-        return {
-            "name": name, "open": open_p, "pre": pre,
-            "price": price, "high": high, "low": low,
-            "vol": vol, "amount": amount
-        }
+        r = requests.get("https://hq.sinajs.cn/rnall.php", headers={"Referer": "https://finance.sina.com/"}, timeout=2)
+        codes = re.findall(r"[szsh](60|00|30|68)\d{4}", r.text)
+        return list({c[-6:] for c in codes})
     except:
-        return None
+        return []
 
 def get_sina_batch(codes):
     try:
-        prefixes = {"6":"sh", "0":"sz", "3":"sz"}
-        sc = []
-        for c in codes:
-            p = prefixes.get(c[0], "sh")
-            sc.append(f"{p}{c}")
-        s = ",".join(sc)
-        url = f"https://hq.sinajs.cn/list={s}"
-        headers = {"Referer": "https://finance.sina.com/"}
-        r = requests.get(url, headers=headers, timeout=3)
-        lines = r.text.splitlines()
+        m = {"6":"sh","0":"sz","3":"sz"}
+        syms = [f"{m.get(c[0],'sh')}{c}" for c in codes[:1800]]
+        url = f"https://hq.sinajs.cn/list={','.join(syms)}"
+        r = requests.get(url, headers={"Referer": "https://finance.sina.com/"}, timeout=2)
         res = {}
-        for line in lines:
-            m = re.search(r'var hq_str_(sh|sz)(\d+)="(.*)";', line)
-            if not m:
-                continue
-            mkt, code, body = m.group(1), m.group(2), m.group(3)
+        for line in r.text.splitlines():
+            g = re.search(r'var hq_str_(sh|sz)(\d+)="(.*)";', line)
+            if not g: continue
+            _, code, body = g.groups()
             arr = body.split(",")
-            if len(arr) < 30:
-                continue
+            if len(arr) < 30: continue
             res[code] = arr
         return res
     except:
         return {}
 
-def get_all_codes():
+def calc_main_power(price, open_p, pre, amount, high, low):
     try:
-        url = "https://hq.sinajs.cn/rnall.php"
-        headers = {"Referer": "https://finance.sina.com/"}
-        r = requests.get(url, headers=headers, timeout=3)
-        codes = re.findall(r'[szsh](60\d{4}|00\d{4}|30\d{4}|68\d{4})', r.text)
-        return list(set([c[-6:] for c in codes]))
+        trend = (price - pre) / pre
+        mom = (price - open_p) / open_p
+        sign = 1 if trend > -0.015 and mom > -0.02 else -1
+        return sign * (abs(trend) + abs(mom)) * amount / 10000
     except:
-        return []
+        return 0
 
-def get_quotes():
+def is_smooth_rise(price, high, low):
     try:
-        codes = get_all_codes()
-        if not codes:
-            return pd.DataFrame()
-        batch = get_sina_batch(codes[:2000])
-        rows = []
-        for code, arr in batch.items():
-            try:
-                if len(arr) < 30:
-                    continue
-                name = arr[0]
-                if "ST" in name or "退" in name:
-                    continue
-                open_p = float(arr[1]) if arr[1] else 0.0
-                pre = float(arr[2]) if arr[2] else 0.0
-                price = float(arr[3]) if arr[3] else 0.0
-                if pre <= 0 or price <= 0:
-                    continue
-                high = float(arr[4]) if arr[4] else 0.0
-                amount = float(arr[9]) if arr[9] else 0.0
-                vol_ratio = 1.0
-                turnover = 2.0
-                cap = price * 1e9
-                main_in = 0.0
+        return (high - price) < (high - low) * 0.3
+    except:
+        return False
 
-                rows.append({
-                    "code": code, "name": name,
-                    "price": price, "pre": pre, "open": open_p,
-                    "vol_ratio": vol_ratio, "amount": amount,
-                    "cap": cap, "high": high, "turnover": turnover,
-                    "main_in": main_in
-                })
-            except:
-                continue
-        return pd.DataFrame(rows)
-    except Exception as e:
-        log.error(f"新浪行情异常: {e}")
-        return pd.DataFrame()
+def est_float_cap(code, price):
+    try:
+        base = {"6":50,"0":40,"3":25,"68":20}.get(code[0],30)
+        return base * price * 100
+    except:
+        return 50
 
-# ====================== 基础数据 ======================
-def load_all_data():
-    global _PREV_Z, _LHB, _CONCEPT, _NORTH, _MARKET_BREADTH
-    _NORTH = 0.0
-    _MARKET_BREADTH = {"rise":1500, "fall":1500, "limit_up":50}
-    log.info("基础数据加载完成（新浪稳定版）")
-
-# ====================== 选股核心 ======================
-def scan():
-    current_phase = phase()
-    if current_phase not in ["morning", "afternoon"]:
-        return []
-
-    max_num = PRE_ZT_MAX_MORNING if current_phase == "morning" else PRE_ZT_MAX_AFTERNOON
-    pushed = PRE_ZT_PUSHED_MORNING if current_phase == "morning" else PRE_ZT_PUSHED_AFTERNOON
-    if len(pushed) >= max_num:
-        return []
-
-    df = get_quotes()
-    if df.empty:
-        return []
-
+def scan_call_auction():
+    codes = get_all_codes()
+    data = get_sina_batch(codes)
     signals = []
-    for _, row in df.iterrows():
+    for code, arr in data.items():
         try:
-            code = row.code
-            if code in pushed:
-                continue
-
-            price = row.price
-            pre = row.pre
-            chg = (price - pre) / pre
-            if not (PRE_ZT_MIN_CHG <= chg <= PRE_ZT_MAX_CHG):
-                continue
-            if row.amount < PRE_ZT_MIN_AUCTION_AMOUNT:
-                continue
-
-            zt_price = round(pre * 1.2, 2) if code.startswith(("300","688")) else round(pre * 1.1, 2)
-            gap = (zt_price - price) / zt_price if zt_price > price else 0
-            if gap < PRE_ZT_GAP_MIN:
-                continue
-
-            atr = price * 0.03
-            stop_loss = price - atr * STOP_LOSS_ATR_MULTIPLIER
-            stop_loss = max(stop_loss, price * (1 - MAX_STOP_LOSS_PCT))
-            stop_loss = min(stop_loss, price * (1 - MIN_STOP_LOSS_PCT))
-
-            reclose = 50
-            score = 65
-            score += int(reclose * 0.2)
-
-            if score < PRE_ZT_MIN_SCORE:
-                continue
-
-            s = Signal(
-                code=code, name=row.name, price=round(price,2),
-                chg=round(chg*100,2), zt_price=zt_price, gap=round(gap*100,2),
-                vol_ratio=round(row.vol_ratio,1), turnover=round(row.turnover,1),
-                main_in=round(row.main_in/10000,0), concept="热点",
-                sector_strength="强", lhb=False, north=False,
-                leader=0, reclose_prob=reclose,
-                rsi=50.0, macd_strong=True, stop_loss=round(stop_loss,2),
-                score=round(score,1), reason=f"回封概率{reclose}%"
-            )
-            signals.append(s)
-            if len(signals) >= max_num:
-                break
+            name, op, pre, p, h, l, amt = arr[0], float(arr[1]), float(arr[2]), float(arr[3]), float(arr[4]), float(arr[5]), float(arr[9])
+            if pre <= 0 or "ST" in name or "退" in name: continue
+            chg = (p-pre)/pre
+            og = (op-pre)/pre
+            smooth = is_smooth_rise(p,h,l)
+            mp = calc_main_power(p,op,pre,amt,h,l)
+            cap = est_float_cap(code,p)
+            if not (og>=0.03 and chg>=0.05 and amt>=3e7 and mp>=200 and smooth and 20<=cap<=200): continue
+            zt = pre*(1.2 if code[0]in("3","6")else 1.1)
+            score = round(90 + (12 if code[0]in("3","6")else 4) + min(15,mp/50),1)
+            if score <94: continue
+            signals.append(Signal(
+                code=code,name=name,price=p,chg=round(chg*100,2),open_p=op,pre=pre,low=l,high=h,amount=amt,
+                main_power=round(mp,1),float_cap=cap,sector="竞价强势",profit_mode="竞价直线冲板",
+                push_title="【9:25竞价·直线冲板】",
+                stop_loss=round(p*0.92,2), take_profit=round(zt*0.98,2), score=score, reason="平滑拉升+量价齐升+市值适中"
+            ))
         except:
             continue
+    return [s for s in signals if s.code not in PUSHED_TODAY]
 
-    signals.sort(key=lambda x: x.score, reverse=True)
-    return signals[:max_num]
+def scan_open_minute():
+    codes = get_all_codes()
+    data = get_sina_batch(codes)
+    signals = []
+    for code, arr in data.items():
+        try:
+            name, op, pre, p, amt = arr[0], float(arr[1]), float(arr[2]), float(arr[3]), float(arr[9])
+            if pre <=0 or "ST" in name: continue
+            chg = (p-pre)/pre
+            mp = calc_main_power(p,op,pre,amt,p,p)
+            cap = est_float_cap(code,p)
+            if not (chg>=0.07 and p>op*1.01 and amt>=5e7 and mp>=300 and 20<=cap<=200): continue
+            zt = pre*(1.2 if code[0]in("3","6")else 1.1)
+            score = round(92 + min(18,mp/40),1)
+            if score<95: continue
+            signals.append(Signal(
+                code=code,name=name,price=p,chg=round(chg*100,2),open_p=op,pre=pre,low=p,high=p,amount=amt,
+                main_power=round(mp,1),float_cap=cap,sector="开盘爆量",profit_mode="开盘瞬间爆拉",
+                push_title="【9:30开盘·瞬间爆拉】",
+                stop_loss=round(p*0.91,2), take_profit=round(zt*0.98,2), score=score, reason="9:30秒拉+真资金+市值健康"
+            ))
+        except:
+            continue
+    return [s for s in signals if s.code not in PUSHED_TODAY]
 
-# ====================== 推送格式 ======================
-def fmt(s, i):
-    return (
-        f"#{i} {s.name}({s.code})\n"
-        f"现价:{s.price} | 涨幅:{s.chg}% | 空间:{s.gap}%\n"
-        f"量比:{s.vol_ratio} | 回封:{s.reclose_prob}%\n"
-        f"止损:{s.stop_loss} | 评分:{s.score}"
-    )
+def scan_all_mode():
+    p = phase()
+    codes = get_all_codes()
+    data = get_sina_batch(codes)
+    signals = []
+    for code, arr in data.items():
+        try:
+            name, op, pre, p, h, l, amt = arr[0], float(arr[1]), float(arr[2]), float(arr[3]), float(arr[4]), float(arr[5]), float(arr[9])
+            if pre<=0 or "ST" in name or "退" in name: continue
+            chg = (p-pre)/pre
+            og = (op-pre)/pre
+            smooth = is_smooth_rise(p,h,l)
+            mp = calc_main_power(p,op,pre,amt,h,l)
+            cap = est_float_cap(code,p)
+            if mp<150 or amt<4e7 or not (20<=cap<=200): continue
+            zt = pre*(1.2 if code[0]in("3","6")else 1.1)
+            ztgap = (zt-p)/zt
 
-def push(signals):
-    if not signals:
-        return
-    current_phase = phase()
-    title = f"【早盘起爆】{len(signals)}只" if current_phase == "morning" else f"【午盘强势】{len(signals)}只"
-    content = f"时间:{now().strftime('%H:%M')}\n\n"
-    content += "\n---\n".join([fmt(s, i+1) for i,s in enumerate(signals)])
-    if send(title, content):
-        for s in signals:
-            if phase() == "morning":
-                PRE_ZT_PUSHED_MORNING.add(s.code)
+            if ztgap>=0.005 and ztgap<=0.05 and chg>=0.07 and p>h*0.985 and smooth:
+                sl,tp,title,mode = p*0.92, zt*0.98, "【首板·高胜率】", "首板"
+            elif og>=0.025 and (op-p)/op>=0.02 and (p-l)/l>=0.012 and -0.01<=chg<=0.07 and smooth:
+                sl,tp,title,mode = p*0.90, p*1.15, "【连板妖股·高爆发】", "连板"
+            elif chg>=0.05 and (h-l)/pre>=0.04 and mp>=200 and (h-p)/p<=0.03:
+                sl,tp,title,mode = p*0.93, p*1.10, "【大肉趋势·稳健】", "趋势"
+            elif p=="endgame" and chg>=0.04 and mp>=250 and p>op*0.995:
+                sl,tp,title,mode = p*0.94, p*1.08, "【尾盘回封·弱转强】", "尾盘"
             else:
-                PRE_ZT_PUSHED_AFTERNOON.add(s.code)
+                continue
 
-# ====================== 主程序 ======================
+            score = round(85 + (12 if code[0]in("3","6")else5) + min(20,mp/50) + (8 if mode in("首板","连板")else3),1)
+            if score<93: continue
+
+            signals.append(Signal(
+                code=code,name=name,price=p,chg=round(chg*100,2),open_p=op,pre=pre,low=l,high=h,amount=amt,
+                main_power=round(mp,1),float_cap=cap,sector="主线热点",profit_mode=mode,
+                push_title=title, stop_loss=round(sl,2), take_profit=round(tp,2), score=score,
+                reason=f"{mode}+主力资金+平滑上涨"
+            ))
+        except:
+            continue
+    return [s for s in signals if s.code not in PUSHED_TODAY]
+
+def push_grouped(signals):
+    groups = {}
+    for s in signals:
+        key = s.push_title
+        if key not in groups:
+            groups[key] = []
+        groups[key].append(s)
+    for title, lst in groups.items():
+        if not lst:
+            continue
+        body = f"{now().strftime('%H:%M')}\n\n"
+        for i, s in enumerate(sorted(lst, key=lambda x:x.score, reverse=True)):
+            body += (f"{title[:-1]} #{i+1} {s.name}({s.code})\n"
+                     f"现:{s.price} 涨:{s.chg}% 主:{s.main_power}万\n"
+                     f"损:{s.stop_loss} 盈:{s.take_profit} 分:{s.score}\n"
+                     f"{s.reason}\n---\n")
+        send(title, body.strip("---\n"))
+        for s in lst:
+            PUSHED_TODAY.add(s.code)
+
 def main():
-    log.info("=== 新浪接口稳定版启动 ===")
-    if not SENDKEY:
-        log.error("未配置 SENDKEY")
-        return
-
+    global JJPUSH, OPEN_PUSH
+    log.info("=== 终极全优化·全分类实盘系统 ===")
     if not is_trading_day():
-        log.info("今天非交易日")
+        log.info("非交易日")
         return
-
-    send("系统启动", "数据源：新浪 | 运行中")
-    load_all_data()
-
+    send("系统启动", "全模式+全优化+分类推送·高胜率低炸板")
     while True:
-        current_phase = phase()
-
-        if current_phase == "closed":
-            log.info("已收盘，等待明日")
+        p = phase()
+        if p == "closed":
+            send("收盘", "今日结束")
             break
-
-        sigs = scan()
-        push(sigs)
-        time.sleep(20)
-
-    send("收盘", "今日交易结束")
-    log.info("交易结束")
+        if p == "call_auction" and not JJPUSH:
+            push_grouped(scan_call_auction())
+            JJPUSH = True
+            time.sleep(2)
+            continue
+        if p == "open_minute" and not OPEN_PUSH:
+            push_grouped(scan_open_minute())
+            OPEN_PUSH = True
+            time.sleep(2)
+            continue
+        push_grouped(scan_all_mode())
+        time.sleep(22)
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        log.error(f"崩溃: {e}")
         send("系统异常", str(e))
