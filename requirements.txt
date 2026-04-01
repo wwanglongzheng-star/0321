@@ -1,6 +1,5 @@
-# 核心依赖（与main.py代码完全适配，版本稳定无冲突）
-requests==2.31.0  # 接口请求核心包
-pandas==2.1.4     # 数据处理核心包
-numpy==1.26.3     # 数值计算辅助包
-python-dotenv==1.0.0  # 环境变量读取（可选，本地运行适配）
-logging==0.5.1.2  # 日志输出（Python内置，冗余声明避免遗漏）
+# 量化打板机器人依赖包，稳定兼容Python 3.9+
+requests==2.32.3
+pandas==2.2.3
+numpy==1.26.4
+python-dotenv==1.0.1
