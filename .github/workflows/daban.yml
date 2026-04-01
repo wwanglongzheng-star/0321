@@ -1,24 +1,25 @@
-name: A股量化打板机器人（双接口同步运行）
+name: A股量化打板机器人
 on:
-  # 定时触发：交易日9:15-15:00每45秒运行一次（匹配缓存时间，避免接口限制）
+  # 定时触发：北京时间周一到周五9:15-15:00，对应UTC 1:15-7:00，每1分钟运行一次
   schedule:
-    - cron: '*/45 1:15-7:00 * * 1-5'  # UTC时间，对应北京时间9:15-15:00（周一至周五）
-  # 手动触发：可随时点击运行
+    - cron: '*/1 1-7 * * 1-5'
+  # 手动触发：可在GitHub Actions页面手动点击运行
   workflow_dispatch:
 
 jobs:
   run-quant-bot:
     runs-on: ubuntu-latest
     steps:
-      # 步骤1：拉取GitHub仓库代码
+      # 步骤1：拉取仓库代码
       - name: 拉取仓库代码
         uses: actions/checkout@v4
 
-      # 步骤2：配置Python环境（适配依赖包版本）
-      - name: 配置Python 3.9
+      # 步骤2：配置Python环境
+      - name: 配置Python 3.10
         uses: actions/setup-python@v5
         with:
-          python-version: '3.9'  # 稳定版本，与依赖包兼容
+          python-version: '3.10'
+          cache: 'pip'
 
       # 步骤3：安装依赖包
       - name: 安装依赖
@@ -26,9 +27,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # 步骤4：运行量化机器人（核心步骤）
+      # 步骤4：运行量化机器人
       - name: 启动打板机器人
         env:
-          # 从GitHub Secrets中读取SENDKEY（需提前在仓库设置中配置）
+          # 从GitHub Secrets中读取SENDKEY
           SENDKEY: ${{ secrets.SENDKEY }}
         run: python main.py
