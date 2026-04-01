@@ -1,35 +1,20 @@
-name: A股量化打板机器人
+name: Trading Bot
 on:
-  # 定时触发：北京时间周一到周五9:15-15:00，对应UTC 1:15-7:00，每1分钟运行一次
   schedule:
-    - cron: '*/1 1-7 * * 1-5'
-  # 手动触发：可在GitHub Actions页面手动点击运行
+    - cron: '20 1 * * 1-5'
+    - cron: '0 5 * * 1-5'
   workflow_dispatch:
 
 jobs:
-  run-quant-bot:
+  run:
     runs-on: ubuntu-latest
+    timeout-minutes: 420
     steps:
-      # 步骤1：拉取仓库代码
-      - name: 拉取仓库代码
-        uses: actions/checkout@v4
-
-      # 步骤2：配置Python环境
-      - name: 配置Python 3.10
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
-          cache: 'pip'
-
-      # 步骤3：安装依赖包
-      - name: 安装依赖
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      # 步骤4：运行量化机器人
-      - name: 启动打板机器人
+          python-version: '3.11'
+      - run: pip install -r requirements.txt
+      - run: python run.py
         env:
-          # 从GitHub Secrets中读取SENDKEY
           SENDKEY: ${{ secrets.SENDKEY }}
-        run: python main.py
