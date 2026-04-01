@@ -1,5 +1,4 @@
-# 量化打板机器人依赖包，稳定兼容Python 3.9+
-requests==2.32.3
-pandas==2.2.3
-numpy==1.26.4
-python-dotenv==1.0.1
+requests
+pandas
+numpy
+ta-lib
