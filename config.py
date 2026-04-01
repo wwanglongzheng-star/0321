@@ -1,6 +1,3 @@
 import os
 
 SENDKEY = os.getenv("SENDKEY", "")
-
-PRE_ZT_MAX_MORNING = 3
-PRE_ZT_MAX_AFTERNOON = 3
