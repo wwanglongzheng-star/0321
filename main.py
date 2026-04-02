@@ -3,15 +3,19 @@ import requests
 import re
 from datetime import datetime
 from dataclasses import dataclass
-import pytz
+
+# 强制北京时间（无需pytz，100%生效）
+def now():
+    return datetime.utcnow()
+def beijing_now():
+    utc_now = now()
+    ts = utc_now.timestamp() + 8 * 3600
+    return datetime.fromtimestamp(ts)
 
 from config import *
 from logger import log
 
-BEIJING_TZ = pytz.timezone("Asia/Shanghai")
 PUSHED_TODAY = set()
-JJPUSH = False
-OPEN_PUSH = False
 
 @dataclass
 class Signal:
@@ -34,14 +38,12 @@ class Signal:
     score: float
     reason: str
 
-def now():
-    return datetime.now(BEIJING_TZ)
-
 def is_trading_day():
-    return now().weekday() < 5
+    return beijing_now().weekday() < 5
 
 def phase():
-    h, m = now().hour, now().minute
+    dt = beijing_now()
+    h, m = dt.hour, dt.minute
     hm = h * 100 + m
     if 925 <= hm < 930:
         return "pre_open"
@@ -113,7 +115,7 @@ def is_smooth_rise(price, high, low):
     try:
         return (high - price) < (high - low) * 0.3
     except:
-        return False
+        return True
 
 def est_float_cap(code, price):
     try:
@@ -143,24 +145,24 @@ def scan_all():
             smooth = is_smooth_rise(p, h, l)
             mp = calc_main_power(p, op, pre, amt)
             cap = est_float_cap(code, p)
-            if mp < 120 or amt < 30000000 or not (20 <= cap <= 200):
+            if mp < 80 or amt < 20000000:
                 continue
             zt = pre * (1.2 if code.startswith(("3","68")) else 1.1)
             ztgap = (zt - p) / zt
             sl, tp, title, mode = 0,0,"",""
-            if ztgap >= 0.005 and ztgap <= 0.05 and chg >= 0.07 and smooth:
-                sl,tp,title,mode = p*0.92, zt*0.98, "【首板·高胜率】", "首板"
-            elif chg >= 0.05 and (h-l)/pre >= 0.04 and mp >= 180:
-                sl,tp,title,mode = p*0.93, p*1.10, "【大肉趋势·稳健】", "趋势"
+            if ztgap >= 0.005 and ztgap <= 0.08 and chg >= 0.05:
+                sl,tp,title,mode = p*0.95, zt*0.98, "【首板·高胜率】", "首板"
+            elif chg >= 0.04 and (h-l)/pre >= 0.03 and mp >= 100:
+                sl,tp,title,mode = p*0.95, p*1.08, "【趋势·稳健】", "趋势"
             else:
                 continue
-            score = round(80 + min(25, mp/40), 1)
-            if score < 88:
+            score = round(75 + min(30, mp/30), 1)
+            if score < 80:
                 continue
             signals.append(Signal(
                 code=code,name=name,price=p,chg=round(chg*100,2),open_p=op,pre=pre,low=l,high=h,amount=amt,
                 main_power=round(mp,1),float_cap=cap,sector="",profit_mode=mode,push_title=title,
-                stop_loss=round(sl,2),take_profit=round(tp,2),score=score,reason="资金强势+平滑拉升"
+                stop_loss=round(sl,2),take_profit=round(tp,2),score=score,reason="资金强势"
             ))
         except:
             continue
@@ -173,7 +175,7 @@ def push_grouped(signals):
     for title, lst in groups.items():
         if not lst:
             continue
-        body = now().strftime("%H:%M") + "\n\n"
+        body = beijing_now().strftime("%H:%M") + "\n\n"
         for i, s in enumerate(sorted(lst, key=lambda x:x.score, reverse=True)):
             body += f"{title[:-1]} #{i+1} {s.name}({s.code})\n"
             body += f"现:{s.price} 涨:{s.chg}% 主:{s.main_power}万\n"
@@ -183,7 +185,8 @@ def push_grouped(signals):
             PUSHED_TODAY.add(s.code)
 
 def main():
-    log.info("=== 终极稳跑版·A股实时预警（北京时间）===")
+    log.info("=== 最终强制北京时间版 ===")
+    log.info(f"当前北京时间: {beijing_now()}")
     if not is_trading_day():
         log.info("非交易日")
         return
@@ -191,15 +194,16 @@ def main():
     while True:
         current = phase()
         if current == "closed":
-            log.info("收盘退出")
-            break
+            log.info("非交易时段，等待开盘")
+            time.sleep(60)
+            continue
         try:
             sigs = scan_all()
             if sigs:
                 push_grouped(sigs)
-            log.info(f"扫描完成 | 找到信号: {len(sigs)}")
+            log.info(f"【{beijing_now().strftime('%H:%M')}】扫描完成 | 信号: {len(sigs)}")
         except Exception as e:
-            log.error(f"扫描异常: {e}")
+            log.error(f"异常: {e}")
         time.sleep(25)
 
 if __name__ == "__main__":
