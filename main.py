@@ -3,10 +3,13 @@ import requests
 import re
 from datetime import datetime
 from dataclasses import dataclass
+import pytz
 
 from config import *
 from logger import log
 
+# 强制使用北京时间
+BEIJING_TZ = pytz.timezone("Asia/Shanghai")
 PUSHED_TODAY = set()
 JJPUSH = False
 OPEN_PUSH = False
@@ -33,25 +36,30 @@ class Signal:
     reason: str
 
 def now():
-    return datetime.now()
+    return datetime.now(BEIJING_TZ)
 
 def is_trading_day():
     return now().weekday() < 5
 
 def phase():
-    h, m = now().hour, now().minute
+    dt = now()
+    h, m = dt.hour, dt.minute
     hm = h * 100 + m
-    if 925 <= hm < 930:
+
+    if 915 <= hm < 925:
         return "call_auction"
-    elif 930 <= hm < 931:
-        return "open_minute"
-    elif 931 <= hm < 1130:
+    elif 925 <= hm < 930:
+        return "pre_open"
+    elif 930 <= hm < 1130:
         return "morning"
-    elif 1300 <= hm < 1430:
+    elif 1130 <= hm < 1300:
+        return "lunch_break"
+    elif 1300 <= hm < 1457:
         return "afternoon"
-    elif 1430 <= hm < 1500:
-        return "endgame"
-    return "closed"
+    elif 1457 <= hm < 1500:
+        return "close_auction"
+    else:
+        return "closed"
 
 def send(title, content):
     if not SENDKEY:
@@ -108,7 +116,7 @@ def is_smooth_rise(price, high, low):
 
 def est_float_cap(code, price):
     try:
-        base = {"6":50,"0":40,"3":25,"6":20}.get(code[0],30)
+        base = {"6":50,"0":40,"3":25,"68":20}.get(code[:2],30)
         return base * price * 100
     except:
         return 50
@@ -232,7 +240,7 @@ def scan_all_mode():
                 sl,tp,title,mode = p*0.90, p*1.15, "【连板妖股·高爆发】", "连板"
             elif chg >= 0.05 and (h-l)/pre >= 0.04 and mp >= 200 and (h-p)/p <= 0.03:
                 sl,tp,title,mode = p*0.93, p*1.10, "【大肉趋势·稳健】", "趋势"
-            elif current_phase == "endgame" and chg >= 0.04 and mp >= 250 and p > op * 0.995:
+            elif current_phase == "close_auction" and chg >= 0.04 and mp >= 250 and p > op * 0.995:
                 sl,tp,title,mode = p*0.94, p*1.08, "【尾盘回封·弱转强】", "尾盘"
             else:
                 continue
@@ -274,19 +282,26 @@ def push_grouped(signals):
 
 def main():
     global JJPUSH, OPEN_PUSH
-    log.info("=== 终极全优化·全分类实盘系统 ===")
+    log.info("=== 终极全优化·全分类实盘系统（北京时间）===")
+    
     if not is_trading_day():
         log.info("非交易日，退出")
         return
-    send("系统启动", "全模式+全优化+分类推送·高胜率低炸板")
+
+    send("系统启动（北京时间）", "全模式+全优化+分类推送·高胜率低炸板")
     log.info("系统启动成功")
 
     while True:
         current = phase()
+
         if current == "closed":
-            send("收盘", "今日交易结束")
+            send("收盘", "今日交易结束（北京时间）")
             log.info("收盘退出")
             break
+
+        if current == "lunch_break":
+            time.sleep(60)
+            continue
 
         if current == "call_auction" and not JJPUSH:
             push_grouped(scan_call_auction())
@@ -294,7 +309,7 @@ def main():
             time.sleep(2)
             continue
 
-        if current == "open_minute" and not OPEN_PUSH:
+        if current == "pre_open" and not OPEN_PUSH:
             push_grouped(scan_open_minute())
             OPEN_PUSH = True
             time.sleep(2)
